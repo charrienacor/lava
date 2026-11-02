@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lava</title>
+<link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
+<style>
+  :root {
+    --bg: #070505;
+    --panel: rgba(255, 214, 178, 0.05);
+    --border: rgba(255, 190, 150, 0.10);
+    --text: #f2e9e2;
+    --dim: #9a8d84;
+    --accent: #f97316;
+    --accent2: #ffc998;
+    --ok: #34d399;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(120% 90% at 50% 34%, #100a07 0%, #0a0706 42%, #050403 100%);
+    color: var(--text);
+    font-family: Helvetica, "Helvetica Neue", Arial, sans-serif;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  /* film grain over the whole stage (static, zero JS cost) */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    opacity: 0.045;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    z-index: 5;
+  }
+
+  /* ---------- wordmark (upper left) ---------- */
+  .brand {
+    position: fixed;
+    top: 20px; left: 24px;
+    z-index: 5;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  /* the wordmark: white "lav", and a molten trailing "a" tying back to the orb */
+  .brand .name {
+    font-size: 27px; font-weight: 700; letter-spacing: -0.4px;
+    line-height: 1.15;
+    -webkit-text-fill-color: transparent; color: transparent;
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 14px rgba(249, 115, 22, 0.32));
+    transition: filter 1.4s ease, opacity 1.4s ease;
+  }
+  .brand .name span { font-style: normal; }
+  /* "la" — clean glass: one bright frosted fill (light catching the top of
+     the glyph, warming toward the base) and a soft bloom.
+     A barely-there gloss drift keeps it feeling alive. */
+  .brand .name .w {
+    background: linear-gradient(180deg,
+      #ffffff 0%,
+      rgba(255,255,255,0.92) 30%,
+      rgba(255,248,240,0.72) 62%,
+      rgba(255,236,216,0.82) 100%);
+    background-size: 100% 120%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text; background-clip: text;
+    text-shadow: 0 0 12px rgba(255, 246, 234, 0.22);
+    animation: glassDrift 9s ease-in-out infinite;
+  }
+  @keyframes glassDrift {
+    0%, 100% { background-position: 0% 0%; }
+    50%      { background-position: 0% 100%; }
+  }
+  /* the trailing "a" — a tiny lava planet (orb ramp, upper-left key light) */
+  .brand .name .mo {
+    background: radial-gradient(circle at 32% 30%,
+      #fff0dc 0%, #ffd098 6%, #fba252 14%, #f07422 26%,
+      #d04a0e 41%, #8e2c0a 58%, #4a1808 82%);
+    background-size: 100% 100%;
+    background-position: 50% 50%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text; background-clip: text;
+    animation: moltenBreath 7s ease-in-out infinite;
+  }
+  @keyframes moltenBreath {
+    0%, 100% { background-size: 100% 100%; }
+    50%      { background-size: 165% 165%; }
+  }
+  /* the full-stop beside the "a" — a tiny molten orb on the same ramp */
+  .brand .name .dot {
+    display: inline-block;
+    width: 0.28em; height: 0.28em;
+    margin-left: 0.12em;
+    border-radius: 50%;
+    background: radial-gradient(circle at 32% 30%,
+      #fff0dc 0%, #ffd098 6%, #fba252 14%, #f07422 26%,
+      #d04a0e 41%, #8e2c0a 58%, #4a1808 82%);
+    background-size: 100% 100%;
+    background-position: 50% 50%;
+    background-repeat: no-repeat;
+    vertical-align: baseline;
+    animation: moltenBreath 7s ease-in-out infinite;
+  }
+  /* the wordmark rides the same state machine as the planet (body classes
+     set in setState()): dim when idle, hot while thinking, warm swell
+     while speaking, a touch brighter while listening */
+  body.idle .brand .name { opacity: 0.88; }
+  body.listening .brand .name {
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 8px rgba(255, 150, 74, 0.28));
+  }
+  body.thinking .brand .name {
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 11px rgba(255, 140, 60, 0.45));
+  }
+  body.speaking .brand .name {
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 9px rgba(255, 130, 56, 0.38));
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .brand .name span { animation: none; }
+    .orb-zone { transition: none; }
+  }
+
+  /* ---------- sound-unlock banner ---------- */
+  .sound-banner {
+    position: fixed; top: 64px; left: 50%; transform: translateX(-50%) translateY(-8px);
+    background: rgba(249,115,22,0.12);
+    border: 1px solid rgba(255,150,80,0.4);
+    color: #ffd9b8; font-size: 13px; font-weight: 600;
+    padding: 10px 18px; border-radius: 999px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s;
+    z-index: 10; white-space: nowrap;
+  }
+  .sound-banner.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ---------- mic-denied banner ---------- */
+  .mic-banner {
+    position: fixed; top: 64px; left: 50%; transform: translateX(-50%) translateY(-8px);
+    background: rgba(249,115,22,0.12);
+    border: 1px solid rgba(255,150,80,0.4);
+    color: #ffd9b8; font-size: 13px; font-weight: 500; line-height: 1.5;
+    padding: 12px 18px; border-radius: 14px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s;
+    z-index: 11; max-width: min(560px, calc(100vw - 40px));
+    display: flex; flex-direction: column; gap: 10px; align-items: center;
+    text-align: center;
+  }
+  .mic-banner.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+  .mic-banner button {
+    background: linear-gradient(90deg, var(--accent), #ffb877);
+    color: #200c02; border: none; border-radius: 999px;
+    font-size: 13px; font-weight: 700; padding: 8px 20px; cursor: pointer;
+  }
+  .mic-banner button:hover { filter: brightness(1.1); }
+
+  /* ---------- main column ---------- */
+  main {
+    flex: 1 1 auto;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 0;
+    padding: 0 20px 12px;
+  }
+
+  /* ---------- planet zone (slides up when talking) ---------- */
+  .orb-zone {
+    flex: 0 0 auto;
+    display: flex; flex-direction: column; align-items: center;
+    transition: transform .65s cubic-bezier(.22,.75,.25,1);
+    will-change: transform;
+  }
+  /* idle: the orb rests at the vertical center of the stage.
+     Tapping to talk removes body.idle and the zone slides back up. */
+  body.idle:not(.risen) .orb-zone {
+    transform: translateY(calc((100vh - min(52vmin, 340px) - 32px) / 2));
+  }
+
+  /* ---------- planet ---------- */
+  .orb-wrap {
+    position: relative;
+    width: min(52vmin, 340px); height: min(52vmin, 340px);
+    flex: 0 0 auto;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas.wave {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+  }
+  .orb-wrap { transition: transform .5s cubic-bezier(.2,.7,.2,1); }
+  .orb-wrap:hover { transform: scale(1.012); }
+
+  .state-label {
+    margin-top: 18px;
+    font-size: 10px; font-weight: 600;
+    letter-spacing: 0.26em; text-transform: uppercase;
+    color: rgba(240, 200, 170, 0.55);
+    transition: opacity .5s;
+    flex: 0 0 auto;
+    height: 14px;
+    text-align: center;
+  }
+  .state-label.hide { opacity: 0; }
+
+  /* ---------- chat ---------- */
+  .chat {
+    flex: 1 1 auto;
+    width: 100%; max-width: 640px;
+    overflow-y: auto;
+    padding: 20px 6px 10px;
+    display: flex; flex-direction: column; gap: 10px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,190,150,0.18) transparent;
+    min-height: 60px;
+  }
+  .chat::-webkit-scrollbar { width: 6px; }
+  .chat::-webkit-scrollbar-thumb { background: rgba(255,190,150,0.18); border-radius: 3px; }
+
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 82%;
+    padding: 10px 15px;
+    border-radius: 18px;
+    font-size: 14.5px;
+    line-height: 1.5;
+    word-wrap: break-word;
+    animation: pop .28s cubic-bezier(.2,.7,.3,1);
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+  .row.user .bubble {
+    background: rgba(255, 214, 178, 0.09);
+    border: 1px solid rgba(255, 190, 140, 0.16);
+    border-bottom-right-radius: 5px;
+    color: #f7ede4;
+  }
+  .row.bot { align-items: flex-end; }
+  .row.bot .bubble {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-bottom-left-radius: 5px;
+  }
+
+</style>
+</head>
+<body>
+
+<div class="sound-banner" id="soundBanner">🔇 tap anywhere to unlock sound</div>
+<div class="mic-banner" id="micBanner"><div id="micBannerMsg"></div><button id="micRetryBtn">Retry microphone</button></div>
+
+<div class="brand">
+  <div class="name"><span class="w">l</span><span class="w">a</span><span class="mo">v</span><span class="mo">a</span><span class="dot"></span></div>
+</div>
+
+<main>
+  <div class="orb-zone" id="orbZone">
+    <div class="orb-wrap" id="orbWrap">
+      <canvas class="wave" id="wave"></canvas>
+    </div>
+    <div class="state-label" id="stateLabel"></div>
+  </div>
+
+  <div class="chat" id="chat"></div>
+</main>
+
+<script>
+"use strict";
+
+// ---------------- state ----------------
+const SR_IN = 16000;
+let ws = null;
+let audioCtx = null;
+let mediaStream = null;
+let processor = null;
+let analyser = null;
+let micData = null;      // Float32Array for the level meter
+let running = false;
+let state = "idle";      // idle | listening | thinking | speaking
+let botAudioCtx = null;  // AudioContext for playback (created on gesture)
+let botQueue = [];       // PCM chunks waiting for the audio context to unlock
+let botPlaying = false;
+let nextStartTime = 0;   // AudioContext clock time the next chunk starts at
+let scheduledSrcs = new Set(); // scheduled-but-unfinished BufferSources
+let chunkSr = null;      // sample rate of the utterance being scheduled
+let heardVoice = false;  // one-time confirm beep on first audio
+let idleTimer = null;    // safety net after the server's "bye"
+let reconnectTries = 0;  // self-heal after a server restart (see onclose)
+// Stable per-tab identity (survives the idle-timeout disconnect) so the
+// server can resume the same conversation when the orb is tapped again.
+let client_id = (() => {
+  try {
+    let id = localStorage.getItem("lava_cid");
+    if (!id) {
+      id = "c_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+      localStorage.setItem("lava_cid", id);
+    }
+    return id;
+  } catch (e) {
+    return "c_anon";
+  }
+})();
+let botGain = null;
+let botAnalyser = null;
+let botMicData = null;
+
+const orbWrap = document.getElementById("orbWrap");
+const stateLabel = document.getElementById("stateLabel");
+const chat = document.getElementById("chat");
+const soundBanner = document.getElementById("soundBanner");
+const micBanner = document.getElementById("micBanner");
+const micBannerMsg = document.getElementById("micBannerMsg");
+const micRetryBtn = document.getElementById("micRetryBtn");
+
+// States:
+//   idle      - slow spin, few soft blobs, low glow
+//   listening - mic level feeds a bulge aimed at the camera
+//   thinking  - fast spin + longitude shear (vortex), hot core
+//   speaking  - radius swells with the TTS playback level
+const canvas = document.getElementById("wave");
+const ctx2d = canvas.getContext("2d");
+const DPR = Math.min(2.5, window.devicePixelRatio || 1);
+let SIZE = 600, ORB_R = 300;
+function fitCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  SIZE = Math.max(64, Math.round(rect.width * DPR)) || 600;
+  canvas.width = SIZE; canvas.height = SIZE;
+  ORB_R = SIZE * 0.335;
+}
+fitCanvas();
+window.addEventListener("resize", fitCanvas);
+
+const RES = 128;
+const buf = document.createElement("canvas");
+buf.width = RES; buf.height = RES;
+const bctx = buf.getContext("2d");
+const img = bctx.createImageData(RES, RES);
+const px = img.data;
+
+// duotone ramp: deep maroon -> burnt orange -> vivid orange -> peach -> cream
+const STOPS = [
+  [0.00, 26, 11, 6],
+  [0.28, 74, 24, 8],
+  [0.46, 142, 44, 10],
+  [0.62, 208, 74, 14],
+  [0.76, 240, 116, 34],
+  [0.87, 251, 162, 82],
+  [0.95, 255, 208, 152],
+  [1.00, 255, 240, 220],
+];
+const LUT = new Uint8ClampedArray(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const t = i / 255;
+  let k = 0;
+  while (k < STOPS.length - 2 && t > STOPS[k + 1][0]) k++;
+  const a = STOPS[k], b = STOPS[k + 1];
+  const f = Math.min(1, Math.max(0, (t - a[0]) / (b[0] - a[0])));
+  LUT[i * 3]     = a[1] + (b[1] - a[1]) * f;
+  LUT[i * 3 + 1] = a[2] + (b[2] - a[2]) * f;
+  LUT[i * 3 + 2] = a[3] + (b[3] - a[3]) * f;
+}
+
+// per-state motion targets (interpolated smoothly every frame)
+const TARGETS = {
+  idle:      { rot: 0.12, energy: 0.32, swirl: 0.10, bright: 0.85, blobs: 4 },
+  listening: { rot: 0.28, energy: 0.55, swirl: 0.22, bright: 0.97, blobs: 5 },
+  thinking:  { rot: 1.10, energy: 1.00, swirl: 1.00, bright: 1.12, blobs: 7 },
+  speaking:  { rot: 0.42, energy: 0.70, swirl: 0.38, bright: 1.00, blobs: 6 },
+};
+const P = { rot: 0.12, energy: 0.32, swirl: 0.10, bright: 0.85, blobs: 4 };
+
+function frac(x) { return x - Math.floor(x); }
+// metaballs drifting in the planet frame: each rides a slow great-circle
+// orbit (two angular frequencies), living slightly above the surface.
+const BLOBS = [];
+for (let i = 0; i < 8; i++) {
+  BLOBS.push({
+    th0: frac(i * 0.618) * Math.PI * 2,          // start longitude
+    ph0: (frac(i * 0.383) - 0.5) * Math.PI * 0.9, // start latitude
+    w1: 0.10 + 0.22 * frac(i * 0.382),            // longitude drift
+    w2: 0.06 + 0.16 * frac(i * 0.723),            // latitude wobble
+    lift: 1.04 + 0.22 * frac(i * 0.517),          // shell radius
+    sig: 0.30 + 0.22 * frac(i * 0.291),
+    amp: 0.50 + 0.50 * frac(i * 0.769),
+  });
+}
+
+// axial tilt (scene leans slightly, like the reference planet)
+const TILT = 0.38;
+const cosT = Math.cos(TILT), sinT = Math.sin(TILT);
+// key light from upper-left-front (canvas y grows downward, so LY is
+// negative to light from above); half vector for the specular sheen
+const LX = -0.42, LY = -0.50, LZ = 0.76;
+let HX = LX, HY = LY, HZ = LZ + 1;
+{ const hl = Math.hypot(HX, HY, HZ); HX /= hl; HY /= hl; HZ /= hl; }
+
+let rotAngle = 0;
+let speechLevel = 0;  // smoothed TTS playback RMS -> speaking swells
+let micLevel = 0;     // smoothed mic RMS -> listening bulge
+let lastT = performance.now();
+
+function renderPlanet(t, dt) {
+  // --- interpolate state params ---
+  const T = TARGETS[state] || TARGETS.idle;
+  const s = Math.min(1, dt * 2.5);
+  P.rot    += (T.rot    - P.rot)    * s;
+  P.energy += (T.energy - P.energy) * s;
+  P.swirl  += (T.swirl  - P.swirl)  * s;
+  P.bright += (T.bright - P.bright) * s;
+  P.blobs  += (T.blobs  - P.blobs)  * s;
+  rotAngle += P.rot * dt * (1 + 0.6 * P.energy);
+
+  // --- audio levels ---
+  let sl = 0;
+  if (botAnalyser && botPlaying && botMicData) {
+    botAnalyser.getFloatTimeDomainData(botMicData);
+    let sum = 0;
+    for (let i = 0; i < botMicData.length; i++) sum += botMicData[i] * botMicData[i];
+    sl = Math.sqrt(sum / botMicData.length) * 7;
+  }
+  speechLevel += (sl - speechLevel) * (sl > speechLevel ? 0.55 : 0.10);
+  const ml = (state === "listening" && running) ? currentLevel() : 0;
+  micLevel += (ml - micLevel) * (ml > micLevel ? 0.45 : 0.08);
+
+  // --- blob positions in the planet frame ---
+  const eOrb = Math.min(1, P.energy + (state === "listening" ? 0.35 * micLevel : 0));
+  const spin = rotAngle;
+  const cosS = Math.cos(spin), sinS = Math.sin(spin);
+  const orb = [];
+  let nB = 0;
+  for (let i = 0; i < 8; i++) {
+    const wgt = P.blobs - i;
+    if (wgt <= 0.01) break;
+    const b = BLOBS[i];
+    const th = b.th0 + b.w1 * t * (0.6 + 0.8 * eOrb);
+    const ph = b.ph0 + b.w2 * t;
+    const r = b.lift + 0.06 * Math.sin(t * 0.8 + i);
+    // spherical -> cartesian, then spin the planet about its (tilted) axis
+    const cp = Math.cos(ph);
+    let x = r * cp * Math.cos(th), y = r * Math.sin(ph), z = r * cp * Math.sin(th);
+    const xs = x * cosS + z * sinS, zs = -x * sinS + z * cosS;
+    const sg = b.sig * (0.8 + 0.35 * eOrb);
+    orb.push(xs, y, zs, 1 / (2 * sg * sg), b.amp * Math.min(1, wgt));
+    nB++;
+  }
+  // barge-in bulge: a soft blob pushed toward the camera when you speak
+  const bulgeAmp = (state === "listening" ? 0.9 * micLevel : 0);
+  const bBx = 0.22, bBy = 0.16, bBz = 0.96;
+
+  // --- fill the low-res disc ---
+  const R = RES / 2;
+  const swirlMax = P.swirl * 1.6;
+  const baseF = 0.30 + 0.05 * Math.sin(t * 0.6);
+  const bright = P.bright;
+  let idx = 0;
+  for (let y = 0; y < RES; y++) {
+    const vy = (y - R + 0.5) / R;
+    for (let x = 0; x < RES; x++, idx += 4) {
+      const vx = (x - R + 0.5) / R;
+      const r2 = vx * vx + vy * vy;
+      if (r2 > 1) { px[idx + 3] = 0; continue; }
+      const rr = Math.sqrt(r2);
+      const z = Math.sqrt(1 - r2);
+
+      // ---- planet-frame surface point: tilt, then longitude shear ----
+      // tilt about X
+      const ty = vy * cosT - z * sinT;
+      const tz = vy * sinT + z * cosT;
+      // differential spin about Y (core turns faster than the rim -> vortex)
+      const sw = spin + swirlMax * (1 - tz * 0.5);
+      const csw = Math.cos(sw), ssw = Math.sin(sw);
+      const ux = vx * csw + tz * ssw;
+      const uz = -vx * ssw + tz * csw;
+      const uy = ty;
+
+      // ---- metaball field ----
+      let F = baseF
+        + 0.07 * Math.sin(2.2 * ux + 1.3 * t) * Math.sin(1.8 * uy - 1.1 * t)
+        + 0.05 * Math.sin(2.8 * uz - 0.9 * t) * Math.sin(2.4 * ux + 0.7 * t);
+      for (let i = 0; i < nB; i++) {
+        const o = i * 5;
+        const dx = ux - orb[o], dy = uy - orb[o + 1], dz = uz - orb[o + 2];
+        F += orb[o + 4] * Math.exp(-(dx * dx + dy * dy + dz * dz) * orb[o + 3]);
+      }
+      if (bulgeAmp > 0.01) {
+        const dx = ux - bBx, dy = uy - bBy, dz = uz - bBz;
+        F += bulgeAmp * Math.exp(-(dx * dx + dy * dy + dz * dz) * 3.2);
+      }
+      F *= 0.86;
+      let ci = (F * 255) | 0;
+      if (ci > 255) ci = 255; else if (ci < 0) ci = 0;
+
+      // ---- spherical shading on the view-space normal ----
+      let diff = LX * vx + LY * vy + LZ * z;          // key light
+      if (diff < 0) diff = 0;
+      const lit = 0.42 + 0.58 * diff;                  // soft ambient floor
+      let spec = HX * vx + HY * vy + HZ * z;           // n.H (V = +z)
+      if (spec <= 0) spec = 0; else spec = spec * spec;              // ^2
+      spec = spec * spec * spec;                        // ^6
+      spec = spec * spec * 0.5;                         // ^12, sheen not glare
+      const limb = Math.pow(z, 0.42);                   // limb darkening
+      const shade = lit * limb * bright;
+      const sp = spec * limb * bright;
+
+      px[idx]     = LUT[ci * 3]     * shade + 255 * sp;
+      px[idx + 1] = LUT[ci * 3 + 1] * shade + 236 * sp;
+      px[idx + 2] = LUT[ci * 3 + 2] * shade + 210 * sp;
+      // crisp circular limb with 1px feather
+      px[idx + 3] = rr > 0.965 ? 255 * ((1 - rr) / 0.035) : 255;
+    }
+  }
+  bctx.putImageData(img, 0, 0);
+
+  // --- composite: atmosphere glow, then the planet ---
+  const swell = 1 + 0.07 * speechLevel * (state === "speaking" ? 1 : 0.4);
+  const drawR = ORB_R * swell;
+  ctx2d.clearRect(0, 0, SIZE, SIZE);
+  const glowR = drawR * 1.5;
+  const g = ctx2d.createRadialGradient(SIZE / 2, SIZE / 2, drawR * 0.55, SIZE / 2, SIZE / 2, glowR);
+  const ga = Math.min(0.5, 0.14 + 0.30 * P.energy);
+  g.addColorStop(0, `rgba(255,110,26,${(ga * 0.55).toFixed(3)})`);
+  g.addColorStop(0.55, `rgba(210,70,14,${(ga * 0.22).toFixed(3)})`);
+  g.addColorStop(1, "rgba(120,35,8,0)");
+  ctx2d.fillStyle = g;
+  ctx2d.fillRect(0, 0, SIZE, SIZE);
+  ctx2d.imageSmoothingEnabled = true;
+  ctx2d.imageSmoothingQuality = "high";
+  ctx2d.drawImage(buf, SIZE / 2 - drawR, SIZE / 2 - drawR, drawR * 2, drawR * 2);
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  renderPlanet(now / 1000, dt);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function currentLevel() {
+  if (!analyser || !micData) return 0;
+  analyser.getFloatTimeDomainData(micData);
+  let sum = 0;
+  for (let i = 0; i < micData.length; i++) sum += micData[i] * micData[i];
+  return Math.sqrt(sum / micData.length) * 3.2; // normalized-ish
+}
+
+// ---------------- state helpers ----------------
+function setState(s) {
+  state = s;
+  orbWrap.className = "orb-wrap" + (s === "idle" ? "" : " " + s);
+  document.body.classList.remove("listening", "thinking", "speaking", "idle");
+  document.body.classList.add(s);
+  if (s === "idle") {
+    stateLabel.textContent = "tap to talk";
+    stateLabel.classList.remove("hide");
+  } else {
+    stateLabel.classList.remove("hide");
+    stateLabel.textContent = s;
+  }
+}
+setState("idle");
+
+// ---------------- chat ----------------
+function addUser(text) {
+  const row = document.createElement("div");
+  row.className = "row user";
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  row.appendChild(b);
+  chat.appendChild(row);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+let botRow = null, botBubble = null;
+function ensureBotRow() {
+  if (botRow) return;
+  botRow = document.createElement("div");
+  botRow.className = "row bot";
+  botBubble = document.createElement("div");
+  botBubble.className = "bubble";
+  botRow.appendChild(botBubble);
+  chat.appendChild(botRow);
+  chat.scrollTop = chat.scrollHeight;
+}
+function finalizeBotRow() {
+  botRow = null; botBubble = null;
+}
+
+// ---------------- bot audio playback ----------------
+function ensureBotCtx() {
+  if (!botAudioCtx) {
+    botAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    botGain = botAudioCtx.createGain();
+    botGain.connect(botAudioCtx.destination);
+    botAnalyser = botAudioCtx.createAnalyser();
+    botAnalyser.fftSize = 1024;
+    botMicData = new Float32Array(botAnalyser.fftSize);
+    botGain.connect(botAnalyser);
+    botAudioCtx.addEventListener("statechange", updateSoundBanner);
+  }
+  unlockAudio();
+}
+
+
+function unlockAudio() {
+  if (!botAudioCtx) return;
+  if (botAudioCtx.state === "suspended") {
+    const p = botAudioCtx.resume();
+    if (p && p.then) p.then(() => { drainBotQueue(); }).catch(() => {});
+  } else {
+    drainBotQueue();
+  }
+  updateSoundBanner();
+}
+
+function updateSoundBanner() {
+  const blocked = !!(botAudioCtx && botAudioCtx.state !== "running");
+  soundBanner.classList.toggle("show", blocked && running);
+}
+
+// Short "audio is working" chirp played once when the session starts.
+function playConfirmBeep() {
+  if (!botAudioCtx || botAudioCtx.state !== "running") return;
+  const t = botAudioCtx.currentTime;
+  const o = botAudioCtx.createOscillator();
+  const g = botAudioCtx.createGain();
+  o.type = "sine";
+  o.frequency.value = 880;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+  o.connect(g); g.connect(botAudioCtx.destination);
+  o.start(t); o.stop(t + 0.2);
+}
+
+function enqueueAudio(i16, sr) {
+  ensureBotCtx();
+  // int16 PCM -> [-1, 1] for AudioBuffer.copyToChannel().
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  if (!botAudioCtx || botAudioCtx.state !== "running") {
+    // Safari: suspended context — stay queued; the statechange listener
+    // (and every tap, via unlockAudio) drains us when audio unlocks.
+    botQueue.push({ data: f32, sr });
+    unlockAudio();
+    return;
+  }
+  drainBotQueue();
+  scheduleChunk(f32, sr);
+}
+
+
+function scheduleChunk(f32, sr) {
+  if (chunkSr !== sr) { chunkSr = sr; nextStartTime = 0; }
+  const now = botAudioCtx.currentTime;
+  if (nextStartTime < now + 0.02) nextStartTime = now + 0.02; // hair of lead time
+  try {
+    const buf = botAudioCtx.createBuffer(1, f32.length, sr);
+    buf.copyToChannel(f32, 0);
+    const src = botAudioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(botGain);
+    src.start(nextStartTime);
+    nextStartTime += buf.duration;
+    scheduledSrcs.add(src);
+    botPlaying = true;
+    setState("speaking");
+    src.onended = () => {
+      scheduledSrcs.delete(src);
+      if (scheduledSrcs.size === 0) {
+        botPlaying = false;
+        if (running) setState("listening");
+      }
+    };
+  } catch (e) {
+    // Never let one bad chunk wedge the whole schedule.
+    console.error("[lava] audio playback failed:", e);
+  }
+}
+
+function drainBotQueue() {
+  while (botQueue.length && botAudioCtx && botAudioCtx.state === "running") {
+    const item = botQueue.shift();
+    scheduleChunk(item.data, item.sr);
+  }
+}
+
+function stopBotAudio() {
+  botQueue = [];
+  nextStartTime = 0;
+  chunkSr = null;
+  const srcs = [...scheduledSrcs];
+  scheduledSrcs.clear();
+  for (const src of srcs) {
+    src.onended = null;
+    try { src.stop(); } catch (e) {}
+  }
+  botPlaying = false;
+}
+
+// ---------------- websocket ----------------
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws?cid=${encodeURIComponent(client_id)}`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    reconnectTries = 0;
+    startMic();
+  };
+
+  ws.onmessage = (ev) => {
+    // Binary frames are bot audio: uint16 LE sample rate + 16-bit LE mono PCM.
+    if (ev.data instanceof ArrayBuffer) {
+      if (!heardVoice) { heardVoice = true; playConfirmBeep(); }
+      const sr = new DataView(ev.data).getUint16(0, true);
+      enqueueAudio(new Int16Array(ev.data, 2), sr);
+      return;
+    }
+    const m = JSON.parse(ev.data);
+    if (m.type === "barge") {
+      // Server detected user speech while the bot was talking - cut the
+      // remaining audio right now (the Pi pipeline behaves the same way).
+      stopBotAudio();
+      finalizeBotRow(null);
+      setState("listening");
+    } else if (m.type === "transcript") {
+      stopBotAudio();   // barge-in: user spoke over the agent
+      addUser(m.text);
+      setState("thinking");
+    } else if (m.type === "text") {
+      ensureBotRow();
+      botBubble.textContent += m.t;
+      chat.scrollTop = chat.scrollHeight;
+    } else if (m.type === "done") {
+      if (!m.reply) {
+        // Empty reply = the LLM SKIPped a TV/room fragment. Leave no trace:
+        // drop this turn's half-empty bot bubble and the fragment's user row.
+        if (botRow) { botRow.remove(); botRow = null; botBubble = null; }
+        const rows = chat.querySelectorAll(".row.user");
+        if (rows.length) rows[rows.length - 1].remove();
+      }
+      finalizeBotRow(m.stats);
+      // The turn is over, but queued audio may still be playing (the server
+      // pipelines TTS) - onended flips the state when playback truly ends.
+      if (running && !botPlaying) setState("listening");
+    } else if (m.type === "error") {
+      finalizeBotRow(null);
+      if (running && !botPlaying) setState("listening");
+    } else if (m.type === "silence") {
+      if (running) setState("listening");
+    } else if (m.type === "bye") {
+      // Idle timeout: the server heard nothing and closed the session.
+      // Stop the mic quietly - no banner. The orb drops back down and the
+      // next tap resumes the same conversation (the server keeps it by cid).
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      running = false;
+      stopMic();
+      stopBotAudio();
+      if (ws) { ws.onclose = null; ws.close(); ws = null; }
+      setState("idle");
+    }
+  };
+
+  ws.onclose = () => {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (running) {
+      running = false;
+      stopMic();
+      stopBotAudio();
+      setState("idle");
+      // The server may just be restarting: keep retrying for ~30 s instead of
+      // the single silent attempt that used to leave the orb dead until the
+      // page was reloaded.
+      if (reconnectTries < 20) {
+        reconnectTries += 1;
+        setTimeout(connect, 1500);
+      }
+    }
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ---------------- mic permission recovery ----------------
+function showMicBanner(err) {
+  const name = err && err.name;
+  let msg;
+  if (name === "NotFoundError") {
+    msg = "No microphone found. Plug one in, then retry.";
+  } else if (name === "NotReadableError") {
+    msg = "Your microphone is busy — another app has it. Close that app, then retry.";
+  } else {
+    msg = "Microphone access was denied. If the prompt doesn't come back, Safari is remembering the denial: click the globe icon in the address bar → Website Settings → Microphone → Allow, then retry.";
+  }
+  micBannerMsg.textContent = msg;
+  micBanner.classList.add("show");
+}
+function hideMicBanner() { micBanner.classList.remove("show"); }
+
+micRetryBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  hideMicBanner();
+  ensureBotCtx();
+  connect();
+});
+
+// ---------------- mic ----------------
+// Mic frames go out as binary WebSocket frames: raw 16-bit LE mono PCM at
+// 16 kHz. No base64, no JSON - a third of the bandwidth and none of the
+// per-message parse cost of the old scheme.
+function sendMicFrame(buf) {
+  if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(buf);
+}
+
+async function startMic() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
+    });
+  } catch (e) {
+    running = false;
+    setState("idle");
+    showMicBanner(e);
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    return;
+  }
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR_IN });
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  const srcNode = audioCtx.createMediaStreamSource(mediaStream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  micData = new Float32Array(analyser.fftSize);
+  srcNode.connect(analyser);
+
+  // Raw PCM via an AudioWorklet, batched to 512-sample (32 ms) binary frames.
+  // The worklet also does the float->int16 conversion, so the main thread only
+  // forwards an ArrayBuffer. The server's Silero VAD consumes 512-sample
+  // frames anyway, so batching here costs zero end-to-end latency while
+  // cutting websocket message rate 4x vs per-quantum (128-sample) sends.
+  let useWorklet = false;
+  if (audioCtx.audioWorklet) {
+    try {
+      const workletCode = `
+class PcmTap extends AudioWorkletProcessor {
+  constructor() { super(); this._buf = new Int16Array(512); this._n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) {
+      for (let i = 0; i < ch.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch[i]));
+        this._buf[this._n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        if (this._n === this._buf.length) {
+          const out = this._buf;
+          this._buf = new Int16Array(out.length);
+          this._n = 0;
+          this.port.postMessage(out.buffer, [out.buffer]);
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-tap", PcmTap);`;
+      const blobUrl = URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" }));
+      await audioCtx.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+      processor = new AudioWorkletNode(audioCtx, "pcm-tap", { numberOfOutputs: 1, outputChannelCount: [1] });
+      processor.port.onmessage = (ev) => sendMicFrame(ev.data);
+      srcNode.connect(processor);
+      useWorklet = true;
+    } catch (e) {
+      console.warn("[lava] AudioWorklet unavailable, using ScriptProcessor:", e);
+      processor = null;
+    }
+  }
+  if (!useWorklet) {
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (ev) => {
+      const f = ev.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f.length);
+      for (let i = 0; i < f.length; i++) {
+        const s = Math.max(-1, Math.min(1, f[i]));
+        i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      sendMicFrame(i16.buffer);
+    };
+    srcNode.connect(processor);
+  }
+  // Keep the capture node pulled (browsers GC a silent-tail processor).
+  const sink = audioCtx.createGain();
+  sink.gain.value = 0;
+  processor.connect(sink);
+  sink.connect(audioCtx.destination);
+
+  running = true;
+  // One-way latch: once the orb has risen for a call, it stays up even
+  // after the call ends (body.idle alone no longer re-centers it).
+  document.body.classList.add("risen");
+  hideMicBanner();
+  setState("listening");
+  // Tell the server the mic is live. The server greets only after this
+  // message, so the greeting answers the "Allow" click instead of preempting
+  // it - and VAD is live from here, so talking over the greeting barges it
+  // (the server answers with a "barge", handled above).
+  ws.send(JSON.stringify({ type: "ready" }));
+}
+
+function stopMic() {
+  if (processor) { try { processor.disconnect(); } catch(e){} processor = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  analyser = null; micData = null;
+}
+
+// ---------------- toggle ----------------
+orbWrap.addEventListener("click", () => {
+  if (!running) {
+    ensureBotCtx();
+    connect();
+  } else {
+    running = false;
+    stopMic();
+    stopBotAudio();
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    setState("idle");
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && e.target === document.body) {
+    e.preventDefault();
+    orbWrap.click();
+  }
+});
+
+// Safari: resume() only works inside a user gesture, and the mic-permission
+// dialog eats the orb click's gesture. So ANY tap or keypress re-arms audio.
+document.addEventListener("pointerdown", unlockAudio, true);
+document.addEventListener("keydown", unlockAudio, true);
+</script>
+</body>
+</html>
