@@ -18,7 +18,7 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
 **Contents:** [Quick start](#quick-start) · [Talking to it](#talking-to-it) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
 [Hosted voice](#optional-hosted-voice-groq-orpheus) ·
-[Raspberry Pi](#raspberry-pi) · [Tests](#tests) · [Troubleshooting](#troubleshooting) ·
+[Raspberry Pi](#raspberry-pi) · [Troubleshooting](#troubleshooting) ·
 [Project layout](#project-layout)
 
 ---
@@ -237,9 +237,6 @@ GROQ_TTS_VOICE=hannah     # autumn/diana/hannah/austin/daniel/troy
 English only. Longer sentences are split at the 180-character API cap and
 stitched automatically. If the hosted voice hits a quota error or the network
 drops, `TTS_FALLBACK=piper` covers the gap so speech never dies mid-sentence.
-Benchmark Piper vs the hosted voice with
-`.venv/bin/python tests/bench_tts.py` (writes WAVs to `/tmp/lava_tts_bench/`
-for by-ear comparison).
 
 ---
 
@@ -258,20 +255,6 @@ for by-ear comparison).
   ArrayBuffers.
 - Watch `ttfa_ms` in the turn stats (also in the logs) — on a Pi expect
   ~1.2–2 s with a tool call, ~0.9–1.4 s without.
-
----
-
-## Tests
-
-No microphone needed — the E2E test feeds Piper-generated speech in as a
-fake mic:
-
-```bash
-.venv/bin/python tests/test_bridge_units.py   # sentence splitter + VAD gates
-.venv/bin/python tests/test_speaker.py        # TTS pipeline ordering / cancellation
-./deploy/start_all.sh && .venv/bin/python -m web.server &   # then:
-.venv/bin/python tests/test_e2e.py            # full loop; uses a few Groq calls
-```
 
 ---
 
@@ -309,7 +292,6 @@ lava/
 │   └── stop_all.sh         # stops them
 ├── mcp_servers/            # asr_server, tts_server, tools_server, common
 ├── web/                    # server.py (bridge + VAD + orchestration), index.html (orb UI)
-├── tests/                  # unit + end-to-end checks, TTS benchmark
 ├── models/piper/           # Piper voice, auto-downloaded on first use
 ├── logs/                   # <name>.log (rotated), <name>.pid, notes.json
 └── .env                    # all configuration
