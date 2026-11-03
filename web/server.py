@@ -52,7 +52,7 @@ TURN_DEADLINE_SECS = float(os.getenv("TURN_DEADLINE_SECS", "45"))
 # Idle handling: after IDLE_PROMPT_SECS of silence the agent asks if you are
 # still there (a different wording each time); IDLE_CHECK_SECS of total
 # silence stops the mic - the next tap resumes the same conversation.
-IDLE_CHECK_SECS = float(os.getenv("IDLE_CHECK_SECS", "45"))
+IDLE_CHECK_SECS = float(os.getenv("IDLE_CHECK_SECS", "80"))
 IDLE_PROMPT_SECS = min(float(os.getenv("IDLE_PROMPT_SECS", "25")),
                        IDLE_CHECK_SECS - 5.0)
 CITY = os.getenv("DEFAULT_CITY", "Quezon City")
