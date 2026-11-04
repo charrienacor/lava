@@ -19,6 +19,7 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
 [Talking to it](#talking-to-it) · [Tools](#tools) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
 [Spotify music](#spotify-music) · [Raspberry Pi](#raspberry-pi) ·
+[Development](#development) ·
 [Troubleshooting](#troubleshooting) · [Project layout](#project-layout) ·
 [Security notes](#security-notes)
 
@@ -32,11 +33,12 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
   "mm-hmm" backchannel or you talking to someone else, and behaves correctly
   for each (see [Overlap handling](#overlap-handling-full-duplex-bench-v15)).
 - **Real tools** — time, weather, web search, Wikipedia, timers, persistent
-  notes, a light switch, Pi health checks, and full Spotify playback control.
+  notes, Pi health checks, and full Spotify playback control.
 - **Natural voice** — local Piper TTS streams the first clause before the
   sentence is finished, so replies start fast.
 - **Robust** — auto-reconnects to its backends, walks an LLM failover chain
-  on quota limits, and degrades TTS to a fallback instead of going silent.
+  on quota limits, and speaks a pre-synthesized apology when a turn fails
+  instead of going silent.
 - **Self-measuring** — live per-turn latency metrics (TTFA, ASR/LLM/TTS
   breakdown) in `/api/status`.
 
@@ -44,8 +46,13 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
 
 ## Quick start
 
-You need **Python ≥ 3.12** and a free **Groq API key**
-(https://console.groq.com/keys — the free tier is enough).
+**Prerequisites**
+
+- Python ≥ 3.12 (a virtualenv is created for you)
+- A free Groq API key — https://console.groq.com/keys (the free tier is
+  enough; it powers both Whisper ASR and the LLM)
+- Optional: a Spotify app and a Premium account for music control
+  ([Spotify music](#spotify-music))
 
 **1. Configure** — create a `.env` file in the project root:
 
@@ -78,6 +85,12 @@ then starts the three MCP servers and the web bridge. When you see
 - **Just talk.** No wake word. Ask for the time, weather, a web search,
   Wikipedia; set timers; save reminders; play Spotify music — it answers out
   loud in a sentence or two.
+- **Spell hard-to-hear words** (names, brands, search terms) by saying a cue
+  and the letters: *"spell that as L-A-V-A"*, *"the letters are Lima Alpha
+  Victor Alpha"*, *"search for the letters J-O-H-N"*. For multi-word terms,
+  say **"space"** between the words: *"spell that as J-O-H-N, space, W-I-C-K"*
+  → `JOHN WICK`. A cue alone ("I'll spell it out") waits up to 15 s for the
+  letters in the next breath.
 - **Interrupt it** by talking while it's answering: it stops immediately and
   listens to what you say next (barge-in).
 - **Going quiet:** after ~50 s of silence it asks *"are you still there?"*
@@ -112,10 +125,10 @@ Manual mode (one terminal per process), if you prefer:
 
 ## Tools
 
-Twenty-seven tools are exposed to the LLM over the tools MCP server
-(`:8003`). Twenty-five are things you can ask for by voice; two
-(`pop_finished_timers`, `music_state`) are internal — the bridge polls them,
-they aren't commands.
+Twenty-six tools live on the tools MCP server (`:8003`). Twenty-four are
+things you can ask for by voice; two (`pop_finished_timers`, `music_state`)
+are internal — the bridge filters them out of the LLM's tool list and polls
+them itself.
 
 | Area | Tool | What it does | Try saying |
 |---|---|---|---|
@@ -130,8 +143,7 @@ they aren't commands.
 | | `list_notes` | Read back saved notes | "what's on my list?" |
 | | `delete_note` | Remove notes matching a phrase | "delete the reminder about eggs" |
 | | `clear_notes` | Delete all notes | "clear my notes" |
-| **System** | `set_light` | Toggle the light (simulated — wire a relay for real) | "turn the light on" |
-| | `system_status` | Pi CPU temp, load, memory, uptime, IP | "how's the Pi doing?" |
+| **System** | `system_status` | Pi CPU temp, load, memory, uptime, IP | "how's the Pi doing?" |
 | **Music** | `music_search` | Find tracks/albums/artists/playlists | "search for lo-fi playlists" |
 | | `music_play` | Play a track/album/playlist (optionally on a device) | "play Bohemian Rhapsody" |
 | | `music_pause` / `music_resume` | Pause / continue | "pause" / "go ahead" |
@@ -165,10 +177,10 @@ WebSocket:
 
 | Process | Port | Role |
 |---|---|---|
-| `web.server` (bridge) | `8080` | The orchestrator. Runs VAD, owns the conversation, drives the LLM, coordinates barge-in, and streams audio to/from the browser over a WebSocket. |
+| `web.server` (bridge) | `8080` | The orchestrator. `web/server.py` wires the routes and lifecycle; the `web/core/` modules run VAD, own the conversation, drive the LLM, coordinate barge-in, and stream audio to/from the browser over a WebSocket. |
 | `mcp_servers.asr_server` | `8001` | Speech-to-text (Groq Whisper). |
 | `mcp_servers.tts_server` | `8002` | Text-to-speech (local Piper, fully offline). |
-| `mcp_servers.tools_server` | `8003` | All 27 tools, including Spotify (via `mcp_servers/spotify.py`). |
+| `mcp_servers.tools_server` | `8003` | All 26 tools, including Spotify (via `mcp_servers/spotify.py`). |
 
 The bridge keeps a persistent connection to each MCP server, probes every 10 s,
 and reconnects automatically if one dies.
@@ -187,7 +199,8 @@ Wire protocol (binary audio, low overhead):
   frames; JSON text frames carry control only (`{"type":"ready"}`).
 - **server → client:** uint16 LE sample rate + 16-bit LE mono PCM, one TTS
   chunk per frame; JSON text frames carry control (`text`, `transcript`,
-  `barge`, `tool`, `done`, `error`, `silence`, `bye`).
+  `transcript_fix`, `barge`, `duck`, `unduck`, `processing`, `tool`, `done`,
+  `error`, `silence`, `bye`).
 
 ### Turn detection (VAD)
 
@@ -255,14 +268,22 @@ reasoning tax or burn the heavy primary's daily quota).
 
 The usual playback device is a laptop speaker sitting next to the mic, so the
 song the agent is playing flows right back in: lyrics become phantom voice
-turns, and the music itself barge-cuts the bot's replies. While a `music_*`
-tool is playing, the bridge therefore tightens its mic gates (louder volume
-floor, higher voiced-ratio, bigger loudness-jump requirement — `MUSIC_MODE_*`
-keys below), drops noisy spans whose transcript looks like the lyrics of the
-current track, suppresses the "are you still there?" idle check-ins, keeps the
-session warm, and skips the transcript-correction pass (it only adds latency
-there). It also injects a per-turn note telling the main LLM the music is
-playing through the speakers, so it does not repeat lyric-like fragments back.
+turns, and the music itself barge-cuts the bot's replies. While music plays
+(the bridge polls Spotify's playback state, so it tracks an external pause
+too), it therefore:
+
+- tightens its mic gates (louder volume floor, higher voiced-ratio, bigger
+  loudness-jump requirement — `MUSIC_MODE_*` keys below);
+- drops sparsely-voiced spans after transcription (the phantom-lyrics guard)
+  — real commands have already passed through the fast path below, so what
+  remains is almost always the song itself;
+- suppresses the "are you still there?" idle check-ins and keeps the session
+  warm while the music runs, plus a grace window after it stops;
+- skips the transcript-correction pass (it would only add latency there);
+- injects a per-turn note that flips the burden of proof for that turn:
+  default to `SKIP`, answer only a clear question or request addressed to
+  the agent — so lyric fragments are never repeated back, while "what time
+  is it?" and "who sings this song?" still work during playback.
 
 While music plays, well-formed commands ("stop", "next", "previous", "louder",
 "set the volume to 40", "play Bohemian Rhapsody"…) skip the LLM entirely and
@@ -313,7 +334,7 @@ most likely to touch first:
 
 ### Full reference
 
-**Bridge & LLM** (`web/server.py`)
+**Bridge & LLM** (`web/core/` — config, llm, mcp_client, speech)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -321,6 +342,7 @@ most likely to touch first:
 | `GROQ_LLM_MODELS` | — | Comma-separated failover chain tried in order on quota errors (429) |
 | `LLM_TEMPERATURE` | `0.8` | Sampling consistency for voice replies |
 | `LLM_MAX_TOKENS` | `768` | Bounds a runaway generation |
+| `LLM_COOLDOWN_SECS` | `60` | How long a model sits out after a quota error before it is tried again |
 | `TURN_DEADLINE_SECS` | `45` | Hard cap on one turn (ASR → tools → speech) |
 | `TOOL_TIMEOUT_SECS` | `12` | Per-tool-call timeout |
 | `TTS_FIRST_CHUNK_CHARS` | `28` | Earliest comma split for the first spoken chunk |
@@ -358,7 +380,7 @@ most likely to touch first:
 | `ASR_LANGUAGE` | `en` | ISO-639-1 hint (`en`, `tl`, …) |
 | `ASR_NO_SPEECH_MAX` / `ASR_LOGPROB_MIN` | `0.8` / `-1.3` | Quality gate: drop segments Whisper itself flags as unintelligible |
 
-**Transcript correction** (`web/server.py`, post-ASR LLM proofread)
+**Transcript correction** (`web/core/llm.py`, post-ASR LLM proofread)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -367,7 +389,8 @@ most likely to touch first:
 | `ASR_CORRECT_MIN_WORDS` | `3` | Skip the pass for turns shorter than this (no API call) |
 | `ASR_CORRECT_CTX` | `6` | Recent messages of context handed to the corrector |
 | `ASR_CORRECT_TIMEOUT` | `2.5 s` | Hard cap; on timeout the raw transcript is used |
-| `ASR_CORRECT_GRACE_SECS` | `0.9` | Grace window before a throttled corrector falls back to the raw text |
+| `ASR_CORRECT_GRACE_SECS` | `0.5` | Grace window before a throttled corrector falls back to the raw text |
+| `ASR_PROOFREAD_LOGPROB_MAX` | `-0.7` | Skip the pass when Whisper's avg logprob is above this (a confident transcript needs no repair) |
 
 **TTS** (`mcp_servers/tts_server.py`)
 
@@ -375,6 +398,13 @@ most likely to touch first:
 |---|---|---|
 | `PIPER_VOICE` | `en_US-hfc_female-medium` | Voice id (auto-downloads to `models/piper/`) |
 | `PIPER_LENGTH_SCALE` | `1.0` | `< 1` speaks faster (try `0.9` on a Pi) |
+
+**Voice spelling** (`web/core/spelling.py`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `SPELLING_EXPECT_TTL` | `15` | How long a cue-only utterance ("I'll spell it out") keeps the next breath waiting for the letters |
+| `SPELLING_CONFIRM_TTL` | `30` | How long a weak-letter confirmation round-trip stays valid |
 
 **Tools & Spotify** (`mcp_servers/tools_server.py`, `mcp_servers/spotify.py`)
 
@@ -464,6 +494,18 @@ which of several to use.
 
 ---
 
+## Development
+
+- Lint with `ruff check` (rules pinned in `ruff.toml` — the codebase is clean
+  against exactly that set).
+- Run the bridge with the MCP servers already up:
+  `.venv/bin/python -m web.server`, or the one-shot `./run.sh`.
+- Logs: `logs/<name>.log` (asr, tts, tools, web — rotated at 10 MB, 3 days
+  kept). The web bridge's turn stats (ASR/LLM/TTS/TTFA breakdown) are logged
+  per turn and summarized in `/api/status` under `fd_metrics`.
+
+---
+
 ## Troubleshooting
 
 - **`Address already in use` on :8080** — a stale bridge holds the port.
@@ -508,7 +550,10 @@ lava/
 │   ├── start_all.sh        # starts the three MCP servers only
 │   └── stop_all.sh         # stops them
 ├── mcp_servers/            # asr_server, tts_server, tools_server, spotify, common
-├── web/                    # server.py (bridge + VAD + orchestration), index.html (orb UI)
+├── web/
+│   ├── server.py           # entry point: HTTP/WebSocket routes + lifecycle
+│   ├── core/               # config, state, mcp_client, llm, vad, speech, music, turn
+│   └── index.html          # orb UI
 ├── models/piper/           # Piper voice, auto-downloaded on first use
 └── logs/                   # <name>.log (rotated), <name>.pid, notes.json, spotify_token.json
 ```
@@ -535,7 +580,6 @@ HTTP/WebSocket endpoints served by the bridge (`:8080`):
   (`logs/*`, with only `notes.json` re-included). Treat the file like a
   password.
 - **`logs/notes.json`** is the one tracked log file (your saved notes).
-- Everything binds to `127.0.0.1` by default; nothing is exposed to the
-  network unless you change `MCP_HOST` / the ports.
-- `set_light` is a **simulated** toggle — wire a relay to real GPIO before
-  trusting it for anything physical.
+- The web bridge binds `127.0.0.1` unconditionally; the three MCP servers
+  bind `MCP_HOST` (default `127.0.0.1`). Nothing is exposed to the network
+  unless you change `MCP_HOST` / the ports.

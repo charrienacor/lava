@@ -3,6 +3,7 @@
 import base64
 import io
 import os
+import sys
 import time
 import wave
 from pathlib import Path
@@ -19,12 +20,15 @@ load_dotenv(ROOT / ".env")
 
 
 def setup_logging(name: str) -> None:
-    """Mirror loguru output to logs/<name>.log (10 MB rotation, 3 days kept).
+    """Point loguru at two sinks: the console (INFO+) and logs/<name>.log (DEBUG+).
 
-    stderr stays the primary sink; the file is a durable copy that survives
-    however the server is launched.
+    Loguru's default stderr sink runs at DEBUG, so without this every debug
+    line floods the terminal. The file stays at DEBUG as the durable copy
+    (10 MB rotation, 3 days kept) that survives however the server is launched.
     """
     LOGS_DIR.mkdir(exist_ok=True)
+    logger.remove()  # drop loguru's default DEBUG-level stderr sink
+    logger.add(sys.stderr, level="INFO")
     logger.add(
         LOGS_DIR / f"{name}.log",
         level="DEBUG",
@@ -70,8 +74,14 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def trim_silence(pcm: bytes, sample_rate: int, *, frame_ms: int = 40,
-                 threshold: float = 0.010, pad_ms: int = 120) -> bytes | None:
+def trim_silence(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    frame_ms: int = 40,
+    threshold: float = 0.010,
+    pad_ms: int = 120,
+) -> bytes | None:
     """Cut leading/trailing near-silence from 16-bit mono PCM.
 
     Spans the VAD hands over (especially around music/TV) carry seconds of
@@ -96,19 +106,14 @@ def trim_silence(pcm: bytes, sample_rate: int, *, frame_ms: int = 40,
     start = max(0, int(loud[0]) - pad_frames) * n
     end = min(n_frames, int(loud[-1]) + pad_frames + 1) * n
     if start <= 0 and end >= len(samples):
-        return pcm                      # nothing worth cutting
+        return pcm  # nothing worth cutting
     return samples[start:end].tobytes()
 
 
-def resample_int16(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """Linear-interpolation resampler; good enough for speech going into ASR."""
-    if src_sr == dst_sr or len(pcm) == 0:
-        return pcm
-    n_out = int(round(len(pcm) * dst_sr / src_sr))
-    x_old = np.linspace(0.0, 1.0, num=len(pcm), endpoint=False)
-    x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
-    return np.interp(x_new, x_old, pcm.astype(np.float32)).astype(np.int16)
+def wav_duration(wav_bytes: bytes) -> tuple[float, int]:
+    """(seconds, sample_rate) from the WAV header alone.
 
-
-def float_to_int16(samples: np.ndarray) -> np.ndarray:
-    return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+    Reads only the RIFF header (no frame data), so callers that just need
+    the clip length - e.g. ASR logging - never pay for a full decode."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        return wf.getnframes() / wf.getframerate(), wf.getframerate()

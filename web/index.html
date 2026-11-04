@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Lava</title>
 <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #070505;
@@ -22,7 +25,7 @@
     background:
       radial-gradient(120% 90% at 50% 34%, #100a07 0%, #0a0706 42%, #050403 100%);
     color: var(--text);
-    font-family: Helvetica, "Helvetica Neue", Arial, sans-serif;
+    font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -48,6 +51,7 @@
   }
   /* the wordmark: white "lav", and a molten trailing "a" tying back to the orb */
   .brand .name {
+    font-family: Helvetica, "Helvetica Neue", Arial, sans-serif; /* wordmark stays off the mono stack */
     font-size: 27px; font-weight: 700; letter-spacing: -0.4px;
     line-height: 1.15;
     -webkit-text-fill-color: transparent; color: transparent;

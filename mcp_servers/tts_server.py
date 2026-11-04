@@ -42,7 +42,11 @@ class Piper:
         self._voice = PiperVoice.load(model_path)
         self.sample_rate = self._voice.config.sample_rate
         self.voice = PIPER_VOICE
-        self._syn = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE) if PIPER_LENGTH_SCALE != 1.0 else None
+        self._syn = (
+            SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
+            if PIPER_LENGTH_SCALE != 1.0
+            else None
+        )
         # One voice, one synthesis at a time: PiperVoice is not documented as
         # thread-safe, and concurrent calls do happen (a timer announcement
         # colliding with a turn's pipelined sentence).
@@ -50,7 +54,8 @@ class Piper:
 
     def _run(self, text: str) -> bytes:
         return b"".join(
-            chunk.audio_int16_bytes for chunk in self._voice.synthesize(text, syn_config=self._syn)
+            chunk.audio_int16_bytes
+            for chunk in self._voice.synthesize(text, syn_config=self._syn)
         )
 
     async def synthesize(self, text: str, voice: str | None) -> tuple[bytes, int]:
@@ -122,7 +127,9 @@ async def synthesize(text: str, voice: str = "") -> dict:
     server_ms = now_ms() - t0
     audio_secs = len(pcm) / 2 / sr if sr else 0.0
     rtf = (server_ms / 1000) / audio_secs if audio_secs else 0.0
-    logger.info(f"[{src}] {server_ms:.0f} ms -> {audio_secs:.2f}s audio (RTF {rtf:.2f}): {text!r}")
+    logger.info(
+        f"[{src}] {server_ms:.0f} ms -> {audio_secs:.2f}s audio (RTF {rtf:.2f}): {text!r}"
+    )
     return {
         "audio_pcm16_b64": b64encode(pcm),
         "sample_rate": sr,
@@ -146,8 +153,12 @@ async def _selftest():
 
     engine = await get_engine()
     t0 = now_ms()
-    pcm, sr = await engine.synthesize("Hello! This is a test of the text to speech server.", None)
-    print(f"{engine.name}: {now_ms() - t0:.0f} ms, {len(pcm) / 2 / sr:.2f}s audio @ {sr} Hz")
+    pcm, sr = await engine.synthesize(
+        "Hello! This is a test of the text to speech server.", None
+    )
+    print(
+        f"{engine.name}: {now_ms() - t0:.0f} ms, {len(pcm) / 2 / sr:.2f}s audio @ {sr} Hz"
+    )
     with wave.open("tts_selftest.wav", "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)

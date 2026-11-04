@@ -11,11 +11,9 @@
 # back to a pgrep on the module names, so it also cleans up servers that
 # were started by hand. Sends SIGTERM first, escalates to SIGKILL after
 # 5 s, and verifies the ports are actually free.
-#
+
 set -u
 
-# This script lives in deploy/, but the project root (where logs/ lives)
-# is the PARENT directory — resolve it, don't assume CWD.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1

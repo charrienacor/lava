@@ -9,8 +9,8 @@
 # The web bridge (web/server.py, :8080) is deliberately NOT started here —
 # run it separately, after the MCP servers are up:
 #   .venv/bin/python -m web.server        # then open http://127.0.0.1:8080
-# (the bridge connects to the MCP servers once at startup and does not
-# retry, so it must start AFTER them)
+# (the bridge auto-reconnects to a dead MCP server every 2 s, but the
+# servers must be up for its first connection, so start them first)
 #
 # Usage:  ./start_all.sh
 #
@@ -18,11 +18,9 @@
 # terminal closes. PIDs are recorded in logs/<name>.pid; stop_all.sh
 # tears them down. Logs land in logs/<name>.log (rotated 10 MB,
 # kept 3 days).
-#
+
 set -u
 
-# This script lives in deploy/, but the project root (where .venv/ and
-# logs/ actually live) is the PARENT directory — resolve it, don't assume CWD.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
@@ -40,15 +38,21 @@ mkdir -p "$LOGS"
 
 # --- helpers ---------------------------------------------------------------
 
+# Readiness = a plain TCP connect (the same nc check stop_all.sh uses).
+# Deliberately NOT an HTTP POST /mcp: each such probe makes the server
+# fabricate and terminate an MCP transport ("Created new transport ...
+# 400 Bad Request / Terminating session" churn — the same behavior the
+# bridge's supervisor comment in web/core/mcp_client.py warns about).
+# "Port up but app not ready" is fine: the bridge's MCPConn
+# auto-reconnects every 2 s until the handshake succeeds.
 port_open() {
-    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$1/"
+    nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1
 }
 
 wait_mcp_ready() {  # <port> <name> <seconds>
     local deadline=$(( SECONDS + $3 ))
     while [ $SECONDS -lt $deadline ]; do
-        if curl -s -o /dev/null --max-time 2 -X POST "http://127.0.0.1:$1/mcp" \
-                -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream"; then
+        if port_open "$1"; then
             return 0
         fi
         sleep 0.5
@@ -73,14 +77,14 @@ start_one asr   8001 mcp_servers.asr_server
 start_one tts   8002 mcp_servers.tts_server
 start_one tools 8003 mcp_servers.tools_server
 
-echo "  waiting for MCP servers to accept connections…"
+echo "  waiting for MCP server ports to accept connections…"
 ok=1
 for pair in "8001 asr" "8002 tts" "8003 tools"; do
     set -- $pair
     if wait_mcp_ready "$1" "$2" 30; then
-        echo "  ✓ $2 MCP ready (:$1)"
+        echo "  ✓ $2 MCP listening (:$1)"
     else
-        echo "  ✗ $2 MCP (:$1) not ready after 30 s — check logs/$2.log"
+        echo "  ✗ $2 MCP (:$1) not accepting connections after 30 s — check logs/$2.log"
         ok=0
     fi
 done

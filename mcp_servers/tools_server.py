@@ -8,7 +8,6 @@ Every tool here uses free services or the Pi itself, with no API keys:
   wikipedia       short encyclopedia summary (Wikipedia REST API)
   set_timer etc.  countdown timers; the agent announces them when they finish
   notes           add / list / delete / clear a persistent to-do / notes list
-  set_light       switch an LED or relay on a GPIO pin (simulated if no GPIO)
   system_status   Pi CPU temperature, load, memory, uptime, IP
   music_*         Spotify search / play / pause / skip / queue / volume /
                   shuffle / repeat / now-playing / devices
@@ -34,7 +33,6 @@ from loguru import logger
 from mcp.server.mcpserver import MCPServer
 
 from mcp_servers import spotify
-
 from mcp_servers.common import ROOT, setup_logging
 
 HOST = os.getenv("MCP_HOST", "127.0.0.1")
@@ -63,13 +61,21 @@ def get_http() -> httpx.AsyncClient:
 # the same few cities, so caching it halves the tool's latency.
 _geo_cache: dict[str, tuple[float, float, str]] = {}
 
+# (lat, lon) -> (monotonic timestamp, formatted result). The forecast itself
+# is a second full round trip (~300-800 ms on the Pi) that "how's the weather?"
+# repeats within seconds; weather doesn't change meaningfully in a minute, so
+# serve repeats from cache. Failures are never cached, so a transient network
+# error still retries on the next call.
+WX_CACHE_TTL = 60.0
+_wx_cache: dict[tuple[float, float], tuple[float, dict]] = {}
+
 
 @asynccontextmanager
 async def _lifespan(_server):
     yield {}
-    global _http
     if _http is not None and not _http.is_closed:
         await _http.aclose()
+    await spotify.close()  # release the pooled Spotify client too
 
 
 mcp = MCPServer(
@@ -100,11 +106,27 @@ def get_time(timezone: str = DEFAULT_TZ) -> dict:
 # weather
 
 WMO_CODES = {
-    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
-    48: "freezing fog", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
-    61: "light rain", 63: "rain", 65: "heavy rain", 71: "light snow", 73: "snow",
-    75: "heavy snow", 80: "light showers", 81: "showers", 82: "violent showers",
-    95: "thunderstorm", 96: "thunderstorm with hail", 99: "severe thunderstorm with hail",
+    0: "clear sky",
+    1: "mainly clear",
+    2: "partly cloudy",
+    3: "overcast",
+    45: "fog",
+    48: "freezing fog",
+    51: "light drizzle",
+    53: "drizzle",
+    55: "heavy drizzle",
+    61: "light rain",
+    63: "rain",
+    65: "heavy rain",
+    71: "light snow",
+    73: "snow",
+    75: "heavy snow",
+    80: "light showers",
+    81: "showers",
+    82: "violent showers",
+    95: "thunderstorm",
+    96: "thunderstorm with hail",
+    99: "severe thunderstorm with hail",
 }
 
 
@@ -134,6 +156,10 @@ async def get_weather(location: str = DEFAULT_CITY) -> dict:
             lat, lon = hit["latitude"], hit["longitude"]
             place = f"{hit['name']}, {hit.get('country', '')}".strip(", ")
             _geo_cache[key] = (lat, lon, place)
+        wx_key = (lat, lon)
+        hit_wx = _wx_cache.get(wx_key)
+        if hit_wx is not None and time.monotonic() - hit_wx[0] < WX_CACHE_TTL:
+            return hit_wx[1]
         wx_resp = await http.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -151,7 +177,7 @@ async def get_weather(location: str = DEFAULT_CITY) -> dict:
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         return {"error": f"weather lookup failed: {e}"}
     cur, day = wx["current"], wx["daily"]
-    return {
+    result = {
         "place": place,
         "conditions": WMO_CODES.get(cur["weather_code"], "unknown"),
         "temperature_c": cur["temperature_2m"],
@@ -162,6 +188,8 @@ async def get_weather(location: str = DEFAULT_CITY) -> dict:
         "today_low_c": day["temperature_2m_min"][0],
         "rain_chance_pct": day["precipitation_probability_max"][0],
     }
+    _wx_cache[(lat, lon)] = (time.monotonic(), result)
+    return result
 
 
 # search / knowledge
@@ -191,13 +219,19 @@ async def web_search(query: str, max_results: int = 4) -> dict:
         # ddgs raises "No results found." when the engine simply has no hits -
         # that is an empty answer, not a failure.
         if "no results" in str(e).lower():
-            return {"query": query, "results": [],
-                    "note": f"No web results for {query!r} - try different wording"}
+            return {
+                "query": query,
+                "results": [],
+                "note": f"No web results for {query!r} - try different wording",
+            }
         return {"error": f"search failed: {str(e)[:200]}"}
     return {
         "query": query,
-        "results": [{"title": h.get("title"), "snippet": h.get("body"), "url": h.get("href")}
-                    for h in hits if h],
+        "results": [
+            {"title": h.get("title"), "snippet": h.get("body"), "url": h.get("href")}
+            for h in hits
+            if h
+        ],
     }
 
 
@@ -212,13 +246,20 @@ async def wikipedia(topic: str) -> dict:
         http = get_http()
         search = await http.get(
             "https://en.wikipedia.org/w/api.php",
-            params={"action": "opensearch", "search": topic, "limit": 1, "format": "json"},
+            params={
+                "action": "opensearch",
+                "search": topic,
+                "limit": 1,
+                "format": "json",
+            },
         )
         search.raise_for_status()
         try:
             search_json = search.json()
         except ValueError:
-            return {"error": f"Wikipedia returned a non-JSON response (status {search.status_code}); try again later"}
+            return {
+                "error": f"Wikipedia returned a non-JSON response (status {search.status_code}); try again later"
+            }
         if not search_json[1]:
             return {"error": f"No Wikipedia article found for {topic}"}
         title = search_json[1][0]
@@ -229,7 +270,9 @@ async def wikipedia(topic: str) -> dict:
         try:
             page = page_resp.json()
         except ValueError:
-            return {"error": f"Wikipedia summary lookup failed (status {page_resp.status_code}); try again later"}
+            return {
+                "error": f"Wikipedia summary lookup failed (status {page_resp.status_code}); try again later"
+            }
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         return {"error": f"Wikipedia lookup failed: {e}"}
     return {"title": page.get("title", title), "summary": page.get("extract", "")}
@@ -258,11 +301,15 @@ async def set_timer(seconds: int, label: str = "timer") -> dict:
         label: Short name such as "pasta" or "break".
     """
     try:
-        seconds = max(1, int(seconds))   # "in 0 seconds" or negatives rot in place
+        seconds = max(1, int(seconds))  # "in 0 seconds" or negatives rot in place
     except (TypeError, ValueError):
         return {"error": f"Timer length {seconds!r} is not a number of seconds."}
     timer_id = uuid.uuid4().hex[:6]
-    _timers[timer_id] = {"label": label, "seconds": seconds, "ends_at": time.time() + seconds}
+    _timers[timer_id] = {
+        "label": label,
+        "seconds": seconds,
+        "ends_at": time.time() + seconds,
+    }
     _timers[timer_id]["task"] = asyncio.create_task(_run_timer(timer_id))
     return {"id": timer_id, "label": label, "seconds": seconds, "status": "started"}
 
@@ -272,7 +319,11 @@ def list_timers() -> dict:
     """List running timers and how long each has left."""
     return {
         "timers": [
-            {"id": k, "label": v["label"], "seconds_left": max(0, round(v["ends_at"] - time.time()))}
+            {
+                "id": k,
+                "label": v["label"],
+                "seconds_left": max(0, round(v["ends_at"] - time.time())),
+            }
             for k, v in _timers.items()
         ]
     }
@@ -298,7 +349,10 @@ def pop_finished_timers() -> dict:
     """Internal: return timers that finished since the last call (polled by the agent)."""
     done = list(_finished)
     _finished.clear()
-    return {"finished": done}
+    # running: how many timers are still counting down. The bridge polls at 1 Hz
+    # while this is > 0 and backs off to 5 s otherwise, so the common no-timer
+    # state costs a round trip every 5 s instead of every second.
+    return {"finished": done, "running": len(_timers)}
 
 
 # notes
@@ -357,8 +411,11 @@ def delete_note(match: str) -> dict:
         else:
             keep.append(n)
     if not deleted:
-        return {"deleted": [], "remaining": notes,
-                "error": f"No note matching {match!r}"}
+        return {
+            "deleted": [],
+            "remaining": notes,
+            "error": f"No note matching {match!r}",
+        }
     _save_notes(keep)
     return {"deleted": deleted, "remaining": keep}
 
@@ -373,41 +430,25 @@ def clear_notes() -> dict:
 
 # system
 
-# Simulated light state; wire a relay to real GPIO before trusting it for
-# anything physical.
-_light_on = False
-
-
-@mcp.tool()
-def set_light(state: str) -> dict:
-    """Turn the light on or off.
-
-    Args:
-        state: "on" or "off".
-    """
-    global _light_on
-    s = state.strip().lower()
-    if s not in ("on", "off"):
-        return {"error": f"state must be 'on' or 'off', got {state!r}"}
-    _light_on = s == "on"
-    return {"light": s}
-
 
 @mcp.tool()
 def system_status() -> dict:
     """Report the Raspberry Pi's health: CPU temperature, load, memory, uptime and IP address."""
     out: dict = {}
     try:
-        out["cpu_temp_c"] = round(int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1)
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            out["cpu_temp_c"] = round(int(f.read()) / 1000, 1)
     except OSError:
         out["cpu_temp_c"] = None
     out["load_1m"] = round(os.getloadavg()[0], 2)
     try:
-        mem = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+        with open("/proc/meminfo") as f:
+            mem = dict(line.split(":", 1) for line in f)
         total = int(mem["MemTotal"].split()[0]) / 1024
         avail = int(mem["MemAvailable"].split()[0]) / 1024
         out["memory_used_pct"] = round(100 * (1 - avail / total))
-        out["uptime_hours"] = round(float(open("/proc/uptime").read().split()[0]) / 3600, 1)
+        with open("/proc/uptime") as f:
+            out["uptime_hours"] = round(float(f.read().split()[0]) / 3600, 1)
     except (OSError, KeyError):
         pass
     try:
@@ -416,7 +457,6 @@ def system_status() -> dict:
             out["ip"] = s.getsockname()[0]
     except OSError:
         out["ip"] = None
-    out["light"] = "on" if _light_on else "off"
     return out
 
 
@@ -436,32 +476,44 @@ def _spotify_error(res: dict) -> dict | None:
     if status == -1:
         # Network/transport failure inside the spotify client (it never
         # raises; -1 is its "couldn't talk to Spotify" code).
-        return {"error": "I couldn't reach Spotify just now - it may be a "
-                         "network blip; try again in a moment."}
+        return {
+            "error": "I couldn't reach Spotify just now - it may be a "
+            "network blip; try again in a moment."
+        }
     if status == 0:
-        return {"error": "Spotify is not linked. Open "
-                         f"http://127.0.0.1:{WEB_PORT}/spotify/auth in a "
-                         "browser to connect it."}
+        return {
+            "error": "Spotify is not linked. Open "
+            f"http://127.0.0.1:{WEB_PORT}/spotify/auth in a "
+            "browser to connect it."
+        }
     if status == 401:
-        return {"error": "Spotify authorization expired. Re-link at "
-                         f"http://127.0.0.1:{WEB_PORT}/spotify/auth."}
+        return {
+            "error": "Spotify authorization expired. Re-link at "
+            f"http://127.0.0.1:{WEB_PORT}/spotify/auth."
+        }
     if status == 429:
-        return {"error": "Spotify is rate-limiting this account right now - "
-                         "wait a few seconds and try again."}
+        return {
+            "error": "Spotify is rate-limiting this account right now - "
+            "wait a few seconds and try again."
+        }
     if status == 403:
         msg = (res.get("json", {}).get("error", {}) or {}).get("message", "") or ""
         low = msg.lower()
         if "volume" in low or "restrict" in low:
             # e.g. the web player: Spotify accepts the account but the device
             # has no remotely controllable volume.
-            return {"error": "This Spotify device does not support remote volume "
-                             "control - the web player is the usual case. Use the "
-                             "volume keys on the device itself."}
+            return {
+                "error": "This Spotify device does not support remote volume "
+                "control - the web player is the usual case. Use the "
+                "volume keys on the device itself."
+            }
         return {"error": "Spotify Premium is required to control playback."}
     if status == 404:
-        return {"error": "No active Spotify device found. Open Spotify on "
-                         "your phone or computer and press play once, then "
-                         "try again."}
+        return {
+            "error": "No active Spotify device found. Open Spotify on "
+            "your phone or computer and press play once, then "
+            "try again."
+        }
     if status >= 400:
         msg = res.get("json", {}).get("error", {}).get("message", "")
         return {"error": f"Spotify said: {msg or status}"}
@@ -473,13 +525,26 @@ def _track_line(t: dict) -> str:
     return f"{t['name']} — {artists}"
 
 
+def _is_browser_device(name: str) -> bool:
+    """True for web-player/browser devices.
+
+    The free web player pauses whenever its tab loses focus - and the user
+    is talking to Lava in a browser tab, so playback there dies seconds in."""
+    low = name.lower()
+    return "web player" in low or any(
+        b in low for b in ("safari", "chrome", "firefox", "edge")
+    )
+
+
 def _device_hint(name: str) -> str:
     """Voice-friendly hint when playback lands somewhere users overlook."""
-    low = name.lower()
-    if "web player" in low or any(b in low for b in ("safari", "chrome", "firefox", "edge")):
-        return ("Playing in the Spotify WEB PLAYER browser tab - remind the "
-                "user to bring that tab to the front and check its mute "
-                "button; the desktop app and other apps stay silent.")
+    if _is_browser_device(name):
+        return (
+            "Playing in the Spotify WEB PLAYER browser tab - it pauses "
+            "whenever that tab loses focus, so the music stops on its own "
+            "as soon as the user switches away. Suggest opening the "
+            "Spotify desktop app instead; also check the tab's mute button."
+        )
     return ""
 
 
@@ -504,15 +569,16 @@ async def _refresh_playback() -> bool:
         return False
     if time.monotonic() - _playback["checked_at"] < PLAYBACK_REFRESH_SECS:
         return _playback["is_playing"]
-    _playback["checked_at"] = time.monotonic()   # claim the slot even on failure
+    _playback["checked_at"] = time.monotonic()  # claim the slot even on failure
     try:
         res = await spotify.api("GET", "/me/player")
         if res["status"] == 200:
             _playback["is_playing"] = bool(res["json"].get("is_playing"))
         elif res["status"] == 204:
             _playback["is_playing"] = False
-    except Exception:
-        pass
+    except Exception as e:
+        # Keep the last known state; the next poll retries.
+        logger.debug(f"playback poll failed, keeping cached state: {e}")
     return _playback["is_playing"]
 
 
@@ -535,8 +601,12 @@ async def music_search(query: str, kind: str = "track") -> dict:
         kind: One of "track", "artist", "album", "playlist".
     """
     kind = kind if kind in _SPOTIFY_KINDS else "track"
-    res = await spotify.api("GET", "/search", require_user=False, params={
-        "q": query, "type": kind, "limit": 5})
+    res = await spotify.api(
+        "GET",
+        "/search",
+        require_user=False,
+        params={"q": query, "type": kind, "limit": 5},
+    )
     err = _spotify_error(res)
     if err:
         return err
@@ -545,12 +615,10 @@ async def music_search(query: str, kind: str = "track") -> dict:
         return {"results": [], "note": f"No {kind} matching {query!r}"}
     out = []
     for it in items:
-        if not it:                     # Spotify occasionally returns null entries
+        if not it:  # Spotify occasionally returns null entries
             continue
         row = {"name": it["name"], "uri": it["uri"]}
-        if kind == "track":
-            row["artist"] = ", ".join(a["name"] for a in it.get("artists", []))
-        elif kind in ("album",):
+        if kind == "track" or kind in ("album",):
             row["artist"] = ", ".join(a["name"] for a in it.get("artists", []))
         elif kind == "playlist":
             row["owner"] = it.get("owner", {}).get("name", "")
@@ -560,10 +628,15 @@ async def music_search(query: str, kind: str = "track") -> dict:
 
 async def _resolve(query: str, kind: str) -> dict:
     """Search and return the best match's uri and display name."""
-    res = await spotify.api("GET", "/search", require_user=False, params={
-        "q": query, "type": kind, "limit": 1})
-    items = [it for it in (res["json"].get(f"{kind}s", {}) or {}).get("items", [])
-             if it]                    # Spotify occasionally returns null entries
+    res = await spotify.api(
+        "GET",
+        "/search",
+        require_user=False,
+        params={"q": query, "type": kind, "limit": 1},
+    )
+    items = [
+        it for it in (res["json"].get(f"{kind}s", {}) or {}).get("items", []) if it
+    ]  # Spotify occasionally returns null entries
     if not items:
         return {"error": f"No {kind} matching {query!r} on Spotify."}
     it = items[0]
@@ -579,11 +652,36 @@ async def _start_playback(body: dict, device: str, fallback_name: str = "") -> d
     qs = ""
     if device:
         d = await spotify.api("GET", "/me/player/devices")
-        match = next((it for it in d.get("json", {}).get("devices", [])
-                      if device.lower() in it["name"].lower()), None)
+        match = next(
+            (
+                it
+                for it in d.get("json", {}).get("devices", [])
+                if device.lower() in it["name"].lower()
+            ),
+            None,
+        )
         if not match:
             return {"error": f"No Spotify device named {device!r}"}
         qs = f"?device_id={match['id']}"
+    else:
+        # No explicit device: if playback would land in a browser web player
+        # and a non-browser device exists, move it there. The free web player
+        # pauses whenever its tab loses focus - and the user is talking to
+        # Lava in a browser tab - so music there dies seconds in.
+        cur = await spotify.api("GET", "/me/player")
+        cur_dev = ((cur.get("json") or {}).get("device") or {}).get("name", "")
+        if _is_browser_device(cur_dev):
+            d = await spotify.api("GET", "/me/player/devices")
+            pref = next(
+                (
+                    it
+                    for it in d.get("json", {}).get("devices", [])
+                    if not _is_browser_device(it["name"])
+                ),
+                None,
+            )
+            if pref:
+                qs = f"?device_id={pref['id']}"
     res = await spotify.api("PUT", f"/me/player/play{qs}", json=body)
     if res["status"] == 404 and not device:
         # nothing active: if exactly one device exists, move playback there
@@ -591,11 +689,22 @@ async def _start_playback(body: dict, device: str, fallback_name: str = "") -> d
         devs = d.get("json", {}).get("devices", [])
         if len(devs) == 1:
             res = await spotify.api(
-                "PUT", f"/me/player/play?device_id={devs[0]['id']}", json=body)
+                "PUT", f"/me/player/play?device_id={devs[0]['id']}", json=body
+            )
         elif devs:
-            names = ", ".join(it["name"] for it in devs)
-            return {"error": f"Several Spotify devices are available ({names}) "
-                             "- say which one to use."}
+            # Several devices: prefer a non-browser one (see above); only
+            # ask the user when every option is a web player.
+            pref = next((it for it in devs if not _is_browser_device(it["name"])), None)
+            if pref:
+                res = await spotify.api(
+                    "PUT", f"/me/player/play?device_id={pref['id']}", json=body
+                )
+            else:
+                names = ", ".join(it["name"] for it in devs)
+                return {
+                    "error": f"Several Spotify devices are available ({names}) "
+                    "- say which one to use."
+                }
     err = _spotify_error(res)
     if err:
         return err
@@ -622,16 +731,18 @@ async def _start_playback(body: dict, device: str, fallback_name: str = "") -> d
         if item:
             out = {"playing": _track_line(item)}
             if want is None or item.get("uri") == want:
-                confirmed = True   # the requested track is on air
+                confirmed = True  # the requested track is on air
                 break
     if dev_name:
-        out["device"] = dev_name   # so the LLM can say WHERE it plays
+        out["device"] = dev_name  # so the LLM can say WHERE it plays
         note = _device_hint(dev_name)
         if not confirmed and not note:
             name = fallback_name or "your request"
-            note = (f"Spotify accepted the command on {dev_name} but has not "
-                    f"confirmed {name} yet - check that the app on that "
-                    "device is open, unlocked, and not muted.")
+            note = (
+                f"Spotify accepted the command on {dev_name} but has not "
+                f"confirmed {name} yet - check that the app on that "
+                "device is open, unlocked, and not muted."
+            )
         if note:
             out["note"] = note
     return out
@@ -652,8 +763,7 @@ async def music_play(query: str, kind: str = "track", device: str = "") -> dict:
     hit = await _resolve(query, kind)
     if "error" in hit:
         return hit
-    body = ({"uris": [hit["uri"]]} if kind == "track"
-            else {"context_uri": hit["uri"]})
+    body = {"uris": [hit["uri"]]} if kind == "track" else {"context_uri": hit["uri"]}
     out = await _start_playback(body, device)
     if "error" not in out:
         out["matched"] = hit["name"]
@@ -670,7 +780,7 @@ async def music_pause() -> dict:
     err = _spotify_error(res)
     if err:
         return err
-    _set_playing(False)   # the mic gates react to music the instant it stops
+    _set_playing(False)  # the mic gates react to music the instant it stops
     return {"paused": True}
 
 
@@ -730,11 +840,14 @@ async def music_skip(direction: str = "next") -> dict:
     # the fallback below instead of reporting a raw Spotify error.)
     # Verify the player actually changed tracks — Spotify accepts the call
     # even when there is nothing to skip to, so trust the read-back, not the
-    # 2xx response. 4 x 0.3 s is enough: Spotify registers a skip within
-    # ~0.3-0.9 s, and the old 5 x 0.8 s loop added up to 4 s of dead wait
-    # whenever the queue was empty (the 7-8 s skips in the logs).
-    for _ in range(4):
-        await asyncio.sleep(0.3)
+    # 2xx response. Probe at 0.2 / 0.5 / 0.8 s (cumulative): Spotify
+    # registers a skip within ~0.3-0.9 s, so a real skip lands on probe 1 or
+    # 2 (0.2-0.5 s instead of the old 0.6-0.9 s), and an empty queue falls
+    # through after 0.8 s and 3 read-backs instead of 1.2 s and 4.
+    waited = 0.0
+    for probe_at in (0.2, 0.5, 0.8):
+        await asyncio.sleep(probe_at - waited)
+        waited = probe_at
         now = await spotify.api("GET", "/me/player")
         if now["status"] != 200:
             break
@@ -753,8 +866,10 @@ async def music_skip(direction: str = "next") -> dict:
         # "Previous" with an empty queue: restart the current track.
         await spotify.api("PUT", "/me/player/seek", params={"position_ms": 0})
         _set_playing(True)
-        return {"restarted": _track_line(cur),
-                "note": "No previous track in the queue - restarted the current song."}
+        return {
+            "restarted": _track_line(cur),
+            "note": "No previous track in the queue - restarted the current song.",
+        }
     # Try each credited artist in turn (featured artists often have no
     # catalog of their own), then fall back to track-name search. The old
     # queries were malformed: `track:` takes a track NAME, so searching
@@ -764,31 +879,47 @@ async def music_skip(direction: str = "next") -> dict:
         name = a.get("name", "")
         if not name:
             continue
-        res2 = await spotify.api("GET", "/search", require_user=False, params={
-            "q": f'artist:"{name}"', "type": "track", "limit": 10})
-        items = [it for it in ((res2["json"].get("tracks", {}) or {}).get("items", []))
-                 if it and it["uri"] != cur_uri]
+        res2 = await spotify.api(
+            "GET",
+            "/search",
+            require_user=False,
+            params={"q": f'artist:"{name}"', "type": "track", "limit": 10},
+        )
+        items = [
+            it
+            for it in ((res2["json"].get("tracks", {}) or {}).get("items", []))
+            if it and it["uri"] != cur_uri
+        ]
         if items:
             break
     if not items:
-        res2 = await spotify.api("GET", "/search", require_user=False, params={
-            "q": f'{cur.get("name", "")}',
-            "type": "track", "limit": 6})
-        items = [it for it in ((res2["json"].get("tracks", {}) or {}).get("items", []))
-                 if it and it["uri"] != cur_uri]
+        res2 = await spotify.api(
+            "GET",
+            "/search",
+            require_user=False,
+            params={"q": f"{cur.get('name', '')}", "type": "track", "limit": 6},
+        )
+        items = [
+            it
+            for it in ((res2["json"].get("tracks", {}) or {}).get("items", []))
+            if it and it["uri"] != cur_uri
+        ]
     if not items:
-        return {"skipped": direction,
-                "note": "No other tracks found by this artist on Spotify - "
-                        "ask me to play a different song."}
+        return {
+            "skipped": direction,
+            "note": "No other tracks found by this artist on Spotify - "
+            "ask me to play a different song.",
+        }
     nxt = items[0]
-    play = await spotify.api("PUT", "/me/player/play",
-                             json={"uris": [nxt["uri"]]})
+    play = await spotify.api("PUT", "/me/player/play", json={"uris": [nxt["uri"]]})
     err = _spotify_error(play)
     if err:
         return err
     _set_playing(True)
-    out = {"playing": _track_line(nxt),
-           "note": "Queue was empty, so played the next song by the same artist."}
+    out = {
+        "playing": _track_line(nxt),
+        "note": "Queue was empty, so played the next song by the same artist.",
+    }
     return out
 
 
@@ -812,9 +943,13 @@ def _volume_target(raw: str) -> tuple[str, int | None, str]:
     if num is not None:
         val = int(num.group(1))
         if val > 100:
-            return "", None, f"Volume {val} percent is out of range - the maximum is 100."
+            return (
+                "",
+                None,
+                f"Volume {val} percent is out of range - the maximum is 100.",
+            )
         if "%" in raw or "percent" in raw:
-            return "", val, ""           # "40 percent" is always absolute
+            return "", val, ""  # "40 percent" is always absolute
         if re.search(r"\+", raw):
             return "+", val, ""
         if re.search(r"[-]", raw) or down and not up:
@@ -823,26 +958,30 @@ def _volume_target(raw: str) -> tuple[str, int | None, str]:
             return "+", val, ""
         return "", val, ""
     if up and not down:
-        return "+", VOLUME_STEP, ""      # "turn it up" — no number given
+        return "+", VOLUME_STEP, ""  # "turn it up" — no number given
     if down and not up:
         return "-", VOLUME_STEP, ""
     if up and down:
         return "", None, "I got both 'up' and 'down' in there - say one direction."
-    return "", None, ""                  # fall through: report current volume
+    return "", None, ""  # fall through: report current volume
 
 
 async def _spotify_current_volume() -> dict:
     """GET /me/player -> {"error"} | {"volume_pct": int|None}."""
     res = await spotify.api("GET", "/me/player")
     if res["status"] == 204:
-        return {"volume_pct": None,
-                "note": "No active Spotify device, so there is no volume to read."}
+        return {
+            "volume_pct": None,
+            "note": "No active Spotify device, so there is no volume to read.",
+        }
     err = _spotify_error(res)
     if err:
         return err
     pct = (res["json"].get("device") or {}).get("volume_percent")
-    return {"volume_pct": pct,
-            "note": "That is the device's own volume, as reported by Spotify."}
+    return {
+        "volume_pct": pct,
+        "note": "That is the device's own volume, as reported by Spotify.",
+    }
 
 
 @mcp.tool()
@@ -860,15 +999,19 @@ async def music_volume(level: str = "") -> dict:
         return await _spotify_current_volume()
     sign, val, err_msg = _volume_target(raw)
     if val is None:
-        return {"error": err_msg or
-                f"I could not understand the volume '{level}'. Say a "
-                "percentage like '40', an adjustment like 'up' or 'down 5', "
-                "'max', or 'mute'."}
+        return {
+            "error": err_msg
+            or f"I could not understand the volume '{level}'. Say a "
+            "percentage like '40', an adjustment like 'up' or 'down 5', "
+            "'max', or 'mute'."
+        }
     res = await spotify.api("GET", "/me/player")
     if res["status"] == 204:
-        return {"error": "No active Spotify device to change the volume on. "
-                         "Open Spotify somewhere and press play once, then "
-                         "try again."}
+        return {
+            "error": "No active Spotify device to change the volume on. "
+            "Open Spotify somewhere and press play once, then "
+            "try again."
+        }
     err = _spotify_error(res)
     if err:
         return err
@@ -879,14 +1022,18 @@ async def music_volume(level: str = "") -> dict:
         target = max(0, (cur or 0) - val)
     else:
         target = val
-    put = await spotify.api("PUT", "/me/player/volume",
-                            params={"volume_percent": target})
+    put = await spotify.api(
+        "PUT", "/me/player/volume", params={"volume_percent": target}
+    )
     err = _spotify_error(put)
     if err:
         return err
     verb = "raised" if sign == "+" else ("lowered" if sign == "-" else "set")
-    out = {"volume_pct": target, "action": verb,
-           "note": f"Volume {verb} to {target} percent."}
+    out = {
+        "volume_pct": target,
+        "action": verb,
+        "note": f"Volume {verb} to {target} percent.",
+    }
     if cur is not None and target == cur:
         out["note"] += " It was already at that level."
     return out
@@ -904,18 +1051,20 @@ async def music_shuffle(state: str = "") -> dict:
         return {"error": "Shuffle takes 'on' or 'off'."}
     res = await spotify.api("GET", "/me/player")
     if res["status"] == 204:
-        return {"shuffle": "unknown",
-                "note": "No active Spotify device, so shuffle state is "
-                        "unknown."}
+        return {
+            "shuffle": "unknown",
+            "note": "No active Spotify device, so shuffle state is unknown.",
+        }
     err = _spotify_error(res)
     if err:
         return err
     if not state:
         on = bool(res["json"].get("shuffle_state", False))
-        return {"shuffle": "on" if on else "off",
-                "note": f"Shuffle is {'on' if on else 'off'}."}
-    put = await spotify.api("PUT", "/me/player/shuffle",
-                            params={"state": state})
+        return {
+            "shuffle": "on" if on else "off",
+            "note": f"Shuffle is {'on' if on else 'off'}.",
+        }
+    put = await spotify.api("PUT", "/me/player/shuffle", params={"state": state})
     err = _spotify_error(put)
     if err:
         return err
@@ -935,9 +1084,10 @@ async def music_repeat(mode: str = "") -> dict:
         return {"error": "Repeat takes 'off', 'track', or 'context'."}
     res = await spotify.api("GET", "/me/player")
     if res["status"] == 204:
-        return {"repeat": "unknown",
-                "note": "No active Spotify device, so repeat state is "
-                        "unknown."}
+        return {
+            "repeat": "unknown",
+            "note": "No active Spotify device, so repeat state is unknown.",
+        }
     err = _spotify_error(res)
     if err:
         return err
@@ -949,8 +1099,11 @@ async def music_repeat(mode: str = "") -> dict:
     err = _spotify_error(put)
     if err:
         return err
-    label = {"off": "off", "track": "on for the current song",
-             "context": "on for the album or playlist"}[mode]
+    label = {
+        "off": "off",
+        "track": "on for the current song",
+        "context": "on for the album or playlist",
+    }[mode]
     return {"repeat": mode, "note": f"Repeat is now {label}."}
 
 
@@ -966,13 +1119,15 @@ async def music_now_playing() -> dict:
     item = res["json"].get("item") or {}
     if not item:
         return {"playing": False, "note": "Nothing is playing right now."}
-    out = {"playing": _track_line(item),
-           "progress_ms": res["json"].get("progress_ms"),
-           "duration_ms": item.get("duration_ms"),
-           "paused": not res["json"].get("is_playing", False)}
+    out = {
+        "playing": _track_line(item),
+        "progress_ms": res["json"].get("progress_ms"),
+        "duration_ms": item.get("duration_ms"),
+        "paused": not res["json"].get("is_playing", False),
+    }
     dev_name = (res["json"].get("device") or {}).get("name", "")
     if dev_name:
-        out["device"] = dev_name   # so the LLM can say WHERE it plays
+        out["device"] = dev_name  # so the LLM can say WHERE it plays
         note = _device_hint(dev_name)
         if note:
             out["note"] = note
@@ -991,8 +1146,7 @@ async def music_queue(query: str) -> dict:
     hit = await _resolve(query, "track")
     if "error" in hit:
         return hit
-    res = await spotify.api("POST", "/me/player/queue",
-                            params={"uri": hit["uri"]})
+    res = await spotify.api("POST", "/me/player/queue", params={"uri": hit["uri"]})
     err = _spotify_error(res)
     if err:
         return err
@@ -1006,16 +1160,14 @@ async def music_devices() -> dict:
     err = _spotify_error(res)
     if err:
         return err
-    devs = [{"name": it["name"], "type": it["type"],
-             "active": it.get("is_active", False)}
-            for it in res["json"].get("devices", [])]
+    devs = [
+        {"name": it["name"], "type": it["type"], "active": it.get("is_active", False)}
+        for it in res["json"].get("devices", [])
+    ]
     return {"devices": devs}
-
 
 
 if __name__ == "__main__":
     setup_logging("tools")
     logger.info(f"Tools MCP server on http://{HOST}:{PORT}/mcp")
     mcp.run("streamable-http", host=HOST, port=PORT)
-
-

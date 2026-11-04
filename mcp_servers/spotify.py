@@ -8,6 +8,7 @@ Auth model:
   - Without one, catalog search still works via client credentials, but
     playback tools return a "not linked" error.
 """
+
 import asyncio
 import base64
 import json
@@ -22,9 +23,11 @@ from mcp_servers.common import LOGS_DIR
 
 API = "https://api.spotify.com/v1"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
-SCOPES = ("user-read-playback-state user-modify-playback-state "
-          "user-read-currently-playing playlist-read-private "
-          "user-library-read")
+SCOPES = (
+    "user-read-playback-state user-modify-playback-state "
+    "user-read-currently-playing playlist-read-private "
+    "user-library-read"
+)
 TOKEN_FILE = LOGS_DIR / "spotify_token.json"
 
 _state = {"access": None, "expires": 0.0}
@@ -57,12 +60,16 @@ async def close() -> None:
 
 
 def _basic() -> str:
-    pair = f"{os.getenv('SPOTIFY_CLIENT_ID', '')}:{os.getenv('SPOTIFY_CLIENT_SECRET', '')}"
+    pair = (
+        f"{os.getenv('SPOTIFY_CLIENT_ID', '')}:{os.getenv('SPOTIFY_CLIENT_SECRET', '')}"
+    )
     return "Basic " + base64.b64encode(pair.encode()).decode()
 
 
 def configured() -> bool:
-    return bool(os.getenv("SPOTIFY_CLIENT_ID")) and bool(os.getenv("SPOTIFY_CLIENT_SECRET"))
+    return bool(os.getenv("SPOTIFY_CLIENT_ID")) and bool(
+        os.getenv("SPOTIFY_CLIENT_SECRET")
+    )
 
 
 def load_refresh() -> str:
@@ -86,23 +93,30 @@ def linked() -> bool:
     return bool(load_refresh())
 
 
-def authorize_url(redirect_uri: str) -> str:
-    return "https://accounts.spotify.com/authorize?" + urlencode({
+def authorize_url(redirect_uri: str, state: str | None = None) -> str:
+    params = {
         "client_id": os.getenv("SPOTIFY_CLIENT_ID", ""),
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "scope": SCOPES,
-    })
+    }
+    if state:
+        params["state"] = state
+    return "https://accounts.spotify.com/authorize?" + urlencode(params)
 
 
 async def exchange_code(code: str, redirect_uri: str) -> bool:
     """One-time: exchange the authorization code and store the refresh token."""
     try:
-        r = await get_client().post(TOKEN_URL, data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }, headers={"Authorization": _basic()})
+        r = await get_client().post(
+            TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            headers={"Authorization": _basic()},
+        )
         if r.status_code != 200:
             return False
         j = r.json()
@@ -134,8 +148,9 @@ async def access_token(require_user: bool) -> str | None:
         _token_fail["kind"] = "unlinked"
         return None
     try:
-        r = await get_client().post(TOKEN_URL, data=data,
-                                    headers={"Authorization": _basic()})
+        r = await get_client().post(
+            TOKEN_URL, data=data, headers={"Authorization": _basic()}
+        )
         if r.status_code != 200:
             _token_fail["kind"] = "unlinked"
             return None
@@ -146,13 +161,12 @@ async def access_token(require_user: bool) -> str | None:
         return None
     _state["access"] = j.get("access_token")
     _state["expires"] = time.time() + j.get("expires_in", 3600) - 60
-    if j.get("refresh_token"):            # Spotify may rotate it
+    if j.get("refresh_token"):  # Spotify may rotate it
         save_refresh(j["refresh_token"])
     return _state["access"]
 
 
-async def api(method: str, path: str, require_user: bool = True,
-              **kwargs) -> dict:
+async def api(method: str, path: str, require_user: bool = True, **kwargs) -> dict:
     """Call the Web API; refresh the token and retry once on 401.
 
     Never raises: transport/token failures come back as
@@ -164,12 +178,14 @@ async def api(method: str, path: str, require_user: bool = True,
     for attempt in range(2):
         token = await access_token(require_user)
         if not token:
-            return {"status": -1 if _token_fail["kind"] == "network" else 0,
-                    "json": {}}
+            return {"status": -1 if _token_fail["kind"] == "network" else 0, "json": {}}
         try:
-            r = await get_client().request(method, API + path,
-                                           headers={"Authorization": f"Bearer {token}"},
-                                           **kwargs)
+            r = await get_client().request(
+                method,
+                API + path,
+                headers={"Authorization": f"Bearer {token}"},
+                **kwargs,
+            )
         except httpx.HTTPError as e:
             # One quick retry in case the failure was transient; a play is
             # worth the 200 ms it costs the rare false alarm.
@@ -180,7 +196,7 @@ async def api(method: str, path: str, require_user: bool = True,
             logger.warning(f"spotify {method} {path} failed: {e}")
             return {"status": -1, "json": {}}
         if r.status_code == 401 and attempt == 0:
-            _state["access"] = None       # force a refresh, then retry
+            _state["access"] = None  # force a refresh, then retry
             continue
         try:
             return {"status": r.status_code, "json": r.json()}

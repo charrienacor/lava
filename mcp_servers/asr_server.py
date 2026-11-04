@@ -14,27 +14,27 @@ import httpx
 from loguru import logger
 from mcp.server.mcpserver import MCPServer
 
-from mcp_servers.common import b64decode, now_ms, pcm16_to_wav, setup_logging, wav_to_pcm16
+from mcp_servers.common import (
+    b64decode,
+    now_ms,
+    pcm16_to_wav,
+    setup_logging,
+    wav_duration,
+)
 
 ASR_BACKEND = os.getenv("ASR_BACKEND", "groq")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_ASR_MODEL = os.getenv("GROQ_ASR_MODEL", "whisper-large-v3-turbo")
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "en")
-# Quality gate for the groq backend (see the transcribe tool): segments whose
-# no_speech_prob / avg_logprob say "sound, but not intelligible speech" are
-# dropped so room noise (TV, music, overlap) never becomes a turn.
 ASR_NO_SPEECH_MAX = float(os.getenv("ASR_NO_SPEECH_MAX", "0.8"))
 ASR_LOGPROB_MIN = float(os.getenv("ASR_LOGPROB_MIN", "-1.3"))
 HOST = os.getenv("MCP_HOST", "127.0.0.1")
 PORT = int(os.getenv("ASR_PORT", "8001"))
-
 ASR_SAMPLE_RATE = 16000
-
 
 
 @asynccontextmanager
 async def lifespan(_server):
-    # Load and warm the default backend before the first request arrives.
     await get_engine(ASR_BACKEND)
     yield {}
 
@@ -51,15 +51,12 @@ class GroqWhisper:
 
     def __init__(self):
         if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY is not set (get a free key at console.groq.com)")
-        # One pooled client keeps the TLS connection warm between turns.
+            raise RuntimeError(
+                "GROQ_API_KEY is not set (get a free key at console.groq.com)"
+            )
         self._client = httpx.AsyncClient(
             base_url="https://api.groq.com/openai/v1",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            # 8 s total: a throttled free-tier call is not worth waiting out
-            # past this - the caller apologizes and the user retries sooner.
-            # (Was 12 s: the logs showed 11-14 s dead-air turns where the
-            # user heard nothing and assumed Lava was broken.)
             timeout=httpx.Timeout(8.0, connect=5.0),
         )
         self.model = GROQ_ASR_MODEL
@@ -71,9 +68,6 @@ class GroqWhisper:
             data={
                 "model": self.model,
                 "language": language,
-                # verbose_json adds per-segment no_speech_prob / avg_logprob -
-                # Whisper's own measure of how degraded the audio was, used by
-                # the quality gate in the transcribe tool below.
                 "response_format": "verbose_json",
                 "temperature": "0",
             },
@@ -90,7 +84,6 @@ class GroqWhisper:
         return j.get("text", "").strip(), quality
 
     async def warmup(self):
-        # Opens the HTTPS connection so the first real turn doesn't pay for TLS setup.
         try:
             await self._client.get("/models")
         except Exception as e:
@@ -106,7 +99,9 @@ async def get_engine(name: str):
     async with _lock:
         if name not in _engines:
             if name not in BACKENDS:
-                raise ValueError(f"Unknown ASR backend '{name}'. Choose from {list(BACKENDS)}")
+                raise ValueError(
+                    f"Unknown ASR backend '{name}'. Choose from {list(BACKENDS)}"
+                )
             logger.info(f"Loading ASR backend: {name}")
             engine = await asyncio.to_thread(BACKENDS[name])
             await engine.warmup()
@@ -115,7 +110,9 @@ async def get_engine(name: str):
 
 
 @mcp.tool()
-async def transcribe(audio_wav_b64: str, language: str = ASR_LANGUAGE, backend: str = "") -> dict:
+async def transcribe(
+    audio_wav_b64: str, language: str = ASR_LANGUAGE, backend: str = ""
+) -> dict:
     """Transcribe speech audio to text.
 
     Args:
@@ -126,30 +123,35 @@ async def transcribe(audio_wav_b64: str, language: str = ASR_LANGUAGE, backend: 
     t0 = now_ms()
     try:
         wav = b64decode(audio_wav_b64)
-        pcm, sr = wav_to_pcm16(wav)
+        # Header-only read: the old full decode (numpy, whole clip) existed
+        # solely to derive the clip length for the log line.
+        audio_secs, _sr = wav_duration(wav)
         engine = await get_engine(backend or ASR_BACKEND)
         text, quality = await engine.transcribe(wav, language)
     except Exception as e:
-        # Never let an exception escape the tool: one raised here tears down
-        # the whole MCP session (anyio's TaskGroup kills it), which took the
-        # agent's ears offline until the bridge happened to reconnect.
         logger.error(f"transcribe failed: {e}")
-        return {"text": "", "error": f"transcribe failed: {str(e)[:200]}",
-                "audio_secs": 0.0, "server_ms": round(now_ms() - t0, 1)}
+        return {
+            "text": "",
+            "error": f"transcribe failed: {str(e)[:200]}",
+            "audio_secs": 0.0,
+            "server_ms": round(now_ms() - t0, 1),
+        }
     server_ms = now_ms() - t0
-    audio_secs = len(pcm) / sr if sr else 0.0
     q = dropped = ""
     if quality:
-        q = (f" no_speech={quality['no_speech_prob']:.2f} "
-             f"logprob={quality['avg_logprob']:.2f}")
-        if (quality["no_speech_prob"] >= ASR_NO_SPEECH_MAX
-                or quality["avg_logprob"] <= ASR_LOGPROB_MIN):
-            # Degraded audio (far field, music, overlap): Whisper heard sound
-            # but does not believe it is intelligible speech. No text keeps it
-            # from becoming a turn; callers already treat empty text as silence.
+        q = (
+            f" no_speech={quality['no_speech_prob']:.2f} "
+            f"logprob={quality['avg_logprob']:.2f}"
+        )
+        if (
+            quality["no_speech_prob"] >= ASR_NO_SPEECH_MAX
+            or quality["avg_logprob"] <= ASR_LOGPROB_MIN
+        ):
             dropped = " DROPPED (degraded audio)"
             text = ""
-    logger.info(f"[{engine.name}] {server_ms:.0f} ms for {audio_secs:.2f}s audio{q}: {text!r}{dropped}")
+    logger.info(
+        f"[{engine.name}] {server_ms:.0f} ms for {audio_secs:.2f}s audio{q}: {text!r}{dropped}"
+    )
     return {
         "text": text,
         "no_speech_prob": quality["no_speech_prob"] if quality else None,
@@ -184,7 +186,9 @@ if __name__ == "__main__":
         asyncio.run(_selftest())
     else:
         setup_logging("asr")
-        logger.info(f"ASR MCP server on http://{HOST}:{PORT}/mcp (backend={ASR_BACKEND})")
+        logger.info(
+            f"ASR MCP server on http://{HOST}:{PORT}/mcp (backend={ASR_BACKEND})"
+        )
         mcp.run(
             "streamable-http",
             host=HOST,

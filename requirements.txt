@@ -6,5 +6,6 @@ httpx>=0.28
 loguru>=0.7
 python-dotenv>=1.0
 numpy>=1.26
+loudness>=0.2
 piper-tts>=1.8
 ddgs>=9.0
