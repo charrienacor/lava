@@ -401,6 +401,47 @@ const LX = -0.42, LY = -0.50, LZ = 0.76;
 let HX = LX, HY = LY, HZ = LZ + 1;
 { const hl = Math.hypot(HX, HY, HZ); HX /= hl; HY /= hl; HZ /= hl; }
 
+// Per-pixel static geometry and shading, precomputed once: the old loop
+// recomputed sqrt/pow chains (limb darkening, ^12 specular, tilt transform)
+// for all 16k pixels on every frame - ~half the render cost for pixels that
+// never change. The per-frame loop below only evaluates the dynamic field.
+const N_PX = RES * RES;
+const A = new Uint8Array(N_PX);            // alpha incl. limb feather (0 = outside)
+const VX = new Float32Array(N_PX), VY = new Float32Array(N_PX);
+const TY = new Float32Array(N_PX), TZP = new Float32Array(N_PX);
+const SWK = new Float32Array(N_PX);        // (1 - tz*0.5) swirl factor
+const LIT = new Float32Array(N_PX);        // 0.42 + 0.58*diffuse
+const SPEC = new Float32Array(N_PX);       // specular^12 * 0.5
+const LIMB = new Float32Array(N_PX);       // z^0.42
+{
+  const R0 = RES / 2;
+  let i = 0;
+  for (let y = 0; y < RES; y++) {
+    const vy = (y - R0 + 0.5) / R0;
+    for (let x = 0; x < RES; x++, i++) {
+      const vx = (x - R0 + 0.5) / R0;
+      const r2 = vx * vx + vy * vy;
+      if (r2 > 1) continue;              // alpha stays 0 (outside the disc)
+      const rr = Math.sqrt(r2);
+      const z = Math.sqrt(1 - r2);
+      A[i] = rr > 0.965 ? 255 * ((1 - rr) / 0.035) : 255;
+      VX[i] = vx; VY[i] = vy;
+      const ty = vy * cosT - z * sinT;
+      const tz = vy * sinT + z * cosT;
+      TY[i] = ty; TZP[i] = tz;
+      SWK[i] = 1 - tz * 0.5;
+      let diff = LX * vx + LY * vy + LZ * z;
+      if (diff < 0) diff = 0;
+      LIT[i] = 0.42 + 0.58 * diff;
+      let spec = HX * vx + HY * vy + HZ * z;
+      spec = spec <= 0 ? 0 : spec * spec;
+      spec = spec * spec * spec;
+      SPEC[i] = spec * spec * 0.5;
+      LIMB[i] = Math.pow(z, 0.42);
+    }
+  }
+}
+
 let rotAngle = 0;
 let speechLevel = 0;  // smoothed TTS playback RMS -> speaking swells
 let micLevel = 0;     // smoothed mic RMS -> listening bulge
@@ -455,66 +496,46 @@ function renderPlanet(t, dt) {
   const bBx = 0.22, bBy = 0.16, bBz = 0.96;
 
   // --- fill the low-res disc ---
-  const R = RES / 2;
   const swirlMax = P.swirl * 1.6;
   const baseF = 0.30 + 0.05 * Math.sin(t * 0.6);
   const bright = P.bright;
   let idx = 0;
-  for (let y = 0; y < RES; y++) {
-    const vy = (y - R + 0.5) / R;
-    for (let x = 0; x < RES; x++, idx += 4) {
-      const vx = (x - R + 0.5) / R;
-      const r2 = vx * vx + vy * vy;
-      if (r2 > 1) { px[idx + 3] = 0; continue; }
-      const rr = Math.sqrt(r2);
-      const z = Math.sqrt(1 - r2);
+  for (let i = 0; i < N_PX; i++, idx += 4) {
+    const a = A[i];
+    if (a === 0) { px[idx + 3] = 0; continue; }
+    const vx = VX[i], vy = VY[i], tz = TZP[i];
 
-      // ---- planet-frame surface point: tilt, then longitude shear ----
-      // tilt about X
-      const ty = vy * cosT - z * sinT;
-      const tz = vy * sinT + z * cosT;
-      // differential spin about Y (core turns faster than the rim -> vortex)
-      const sw = spin + swirlMax * (1 - tz * 0.5);
-      const csw = Math.cos(sw), ssw = Math.sin(sw);
-      const ux = vx * csw + tz * ssw;
-      const uz = -vx * ssw + tz * csw;
-      const uy = ty;
+    // ---- differential spin about Y (core turns faster than the rim) ----
+    const sw = spin + swirlMax * SWK[i];
+    const csw = Math.cos(sw), ssw = Math.sin(sw);
+    const ux = vx * csw + tz * ssw;
+    const uz = -vx * ssw + tz * csw;
+    const uy = TY[i];
 
-      // ---- metaball field ----
-      let F = baseF
-        + 0.07 * Math.sin(2.2 * ux + 1.3 * t) * Math.sin(1.8 * uy - 1.1 * t)
-        + 0.05 * Math.sin(2.8 * uz - 0.9 * t) * Math.sin(2.4 * ux + 0.7 * t);
-      for (let i = 0; i < nB; i++) {
-        const o = i * 5;
-        const dx = ux - orb[o], dy = uy - orb[o + 1], dz = uz - orb[o + 2];
-        F += orb[o + 4] * Math.exp(-(dx * dx + dy * dy + dz * dz) * orb[o + 3]);
-      }
-      if (bulgeAmp > 0.01) {
-        const dx = ux - bBx, dy = uy - bBy, dz = uz - bBz;
-        F += bulgeAmp * Math.exp(-(dx * dx + dy * dy + dz * dz) * 3.2);
-      }
-      F *= 0.86;
-      let ci = (F * 255) | 0;
-      if (ci > 255) ci = 255; else if (ci < 0) ci = 0;
-
-      // ---- spherical shading on the view-space normal ----
-      let diff = LX * vx + LY * vy + LZ * z;          // key light
-      if (diff < 0) diff = 0;
-      const lit = 0.42 + 0.58 * diff;                  // soft ambient floor
-      let spec = HX * vx + HY * vy + HZ * z;           // n.H (V = +z)
-      if (spec <= 0) spec = 0; else spec = spec * spec;              // ^2
-      spec = spec * spec * spec;                        // ^6
-      spec = spec * spec * 0.5;                         // ^12, sheen not glare
-      const limb = Math.pow(z, 0.42);                   // limb darkening
-      const shade = lit * limb * bright;
-      const sp = spec * limb * bright;
-
-      px[idx]     = LUT[ci * 3]     * shade + 255 * sp;
-      px[idx + 1] = LUT[ci * 3 + 1] * shade + 236 * sp;
-      px[idx + 2] = LUT[ci * 3 + 2] * shade + 210 * sp;
-      // crisp circular limb with 1px feather
-      px[idx + 3] = rr > 0.965 ? 255 * ((1 - rr) / 0.035) : 255;
+    // ---- metaball field ----
+    let F = baseF
+      + 0.07 * Math.sin(2.2 * ux + 1.3 * t) * Math.sin(1.8 * uy - 1.1 * t)
+      + 0.05 * Math.sin(2.8 * uz - 0.9 * t) * Math.sin(2.4 * ux + 0.7 * t);
+    for (let b = 0; b < nB; b++) {
+      const o = b * 5;
+      const dx = ux - orb[o], dy = uy - orb[o + 1], dz = uz - orb[o + 2];
+      F += orb[o + 4] * Math.exp(-(dx * dx + dy * dy + dz * dz) * orb[o + 3]);
     }
+    if (bulgeAmp > 0.01) {
+      const dx = ux - bBx, dy = uy - bBy, dz = uz - bBz;
+      F += bulgeAmp * Math.exp(-(dx * dx + dy * dy + dz * dz) * 3.2);
+    }
+    F *= 0.86;
+    let ci = (F * 255) | 0;
+    if (ci > 255) ci = 255; else if (ci < 0) ci = 0;
+
+    // ---- precomputed spherical shading (key light, specular, limb) ----
+    const shade = LIT[i] * LIMB[i] * bright;
+    const sp = SPEC[i] * LIMB[i] * bright;
+    px[idx]     = LUT[ci * 3]     * shade + 255 * sp;
+    px[idx + 1] = LUT[ci * 3 + 1] * shade + 236 * sp;
+    px[idx + 2] = LUT[ci * 3 + 2] * shade + 210 * sp;
+    px[idx + 3] = a;
   }
   bctx.putImageData(img, 0, 0);
 
@@ -535,10 +556,19 @@ function renderPlanet(t, dt) {
   ctx2d.drawImage(buf, SIZE / 2 - drawR, SIZE / 2 - drawR, drawR * 2, drawR * 2);
 }
 
+// Frame-rate cap: the orb's motion is slow, and on a 60 Hz display a 20 ms
+// minimum makes the loop render every other frame (~30 fps) - visually
+// identical for this animation, and it frees real main-thread time for the
+// audio scheduling and WebSocket work that share this thread.
+const FRAME_MIN_MS = 20;
 function frame(now) {
-  const dt = Math.min(0.05, (now - lastT) / 1000);
+  const dt = (now - lastT) / 1000;
+  if (dt < FRAME_MIN_MS / 1000) {
+    requestAnimationFrame(frame);
+    return;
+  }
   lastT = now;
-  renderPlanet(now / 1000, dt);
+  renderPlanet(now / 1000, Math.min(0.05, dt));
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -661,7 +691,15 @@ function enqueueAudio(i16, sr) {
 function scheduleChunk(f32, sr) {
   if (chunkSr !== sr) { chunkSr = sr; nextStartTime = 0; }
   const now = botAudioCtx.currentTime;
-  if (nextStartTime < now + 0.02) nextStartTime = now + 0.02; // hair of lead time
+  // Once scheduled, WebAudio plays on its own thread - the enemy is the gap
+  // between chunks: if delivery lags real time, a schedule primed only 20 ms
+  // ahead drained on every main-thread hiccup (the orb renderer, GC) and the
+  // reply stuttered. Keep ~120 ms buffered while streaming; the first chunk
+  // after a cut/new utterance stays tight so time-to-first-audio doesn't pay
+  // for it. Barge-in is unaffected: stopBotAudio() kills scheduled sources
+  // instantly regardless of how far ahead they sit.
+  const lead = nextStartTime > 0 ? 0.12 : 0.03;
+  if (nextStartTime < now + lead) nextStartTime = now + lead;
   try {
     const buf = botAudioCtx.createBuffer(1, f32.length, sr);
     buf.copyToChannel(f32, 0);
@@ -704,6 +742,22 @@ function stopBotAudio() {
     try { src.stop(); } catch (e) {}
   }
   botPlaying = false;
+  duckBot(false);
+}
+
+// Barge-in ducking: when speech starts over the bot, the server ducks (not
+// cuts) the playback immediately - the interruption is heard instantly - and
+// either restores the gain (the overlap turned out to be "mm-hmm") or sends
+// "barge" to hard-cut. The watchdog restores after 2.5 s no matter what, so
+// a lost message can never leave the bot whispering.
+let duckTimer = null;
+function duckBot(on) {
+  if (!botGain || !botAudioCtx) return;
+  const t = botAudioCtx.currentTime;
+  botGain.gain.cancelScheduledValues(t);
+  botGain.gain.setTargetAtTime(on ? 0.15 : 1.0, t, on ? 0.04 : 0.06);
+  if (duckTimer) { clearTimeout(duckTimer); duckTimer = null; }
+  if (on) duckTimer = setTimeout(() => { duckTimer = null; duckBot(false); }, 2500);
 }
 
 // ---------------- websocket ----------------
@@ -726,16 +780,33 @@ function connect() {
       return;
     }
     const m = JSON.parse(ev.data);
-    if (m.type === "barge") {
+    if (m.type === "duck") {
+      duckBot(true);
+    } else if (m.type === "unduck") {
+      duckBot(false);
+    } else if (m.type === "barge") {
       // Server detected user speech while the bot was talking - cut the
       // remaining audio right now (the Pi pipeline behaves the same way).
       stopBotAudio();
       finalizeBotRow(null);
       setState("listening");
+    } else if (m.type === "processing") {
+      // The bridge has the utterance and is transcribing: switch to
+      // "thinking" now instead of sitting on "listening" while a slow ASR
+      // round trip runs (the orb looked deaf). Guarded by botPlaying: a
+      // backchannel over the bot must not flicker the state away from
+      // "speaking" (the bot keeps talking in that case).
+      if (running && !botPlaying) setState("thinking");
     } else if (m.type === "transcript") {
       stopBotAudio();   // barge-in: user spoke over the agent
       addUser(m.text);
       setState("thinking");
+    } else if (m.type === "transcript_fix") {
+      // The proofread pass corrected a mis-hearing: update the user's last
+      // bubble in place (it was shown immediately, before the fix landed).
+      const rows = chat.querySelectorAll(".row.user");
+      const b = rows.length && rows[rows.length - 1].querySelector(".bubble");
+      if (b) b.textContent = m.text;
     } else if (m.type === "text") {
       ensureBotRow();
       botBubble.textContent += m.t;
@@ -756,7 +827,9 @@ function connect() {
       finalizeBotRow(null);
       if (running && !botPlaying) setState("listening");
     } else if (m.type === "silence") {
-      if (running) setState("listening");
+      // Same guard as done/error: with a deferred overlap the bot may still
+      // be talking (the span was noise) - don't flip the orb out of speaking.
+      if (running && !botPlaying) setState("listening");
     } else if (m.type === "bye") {
       // Idle timeout: the server heard nothing and closed the session.
       // Stop the mic quietly - no banner. The orb drops back down and the

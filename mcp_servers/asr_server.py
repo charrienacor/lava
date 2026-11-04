@@ -56,7 +56,11 @@ class GroqWhisper:
         self._client = httpx.AsyncClient(
             base_url="https://api.groq.com/openai/v1",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            timeout=httpx.Timeout(15.0, connect=5.0),
+            # 8 s total: a throttled free-tier call is not worth waiting out
+            # past this - the caller apologizes and the user retries sooner.
+            # (Was 12 s: the logs showed 11-14 s dead-air turns where the
+            # user heard nothing and assumed Lava was broken.)
+            timeout=httpx.Timeout(8.0, connect=5.0),
         )
         self.model = GROQ_ASR_MODEL
 
@@ -120,10 +124,18 @@ async def transcribe(audio_wav_b64: str, language: str = ASR_LANGUAGE, backend: 
         backend: Optional override (currently only "groq").
     """
     t0 = now_ms()
-    wav = b64decode(audio_wav_b64)
-    pcm, sr = wav_to_pcm16(wav)
-    engine = await get_engine(backend or ASR_BACKEND)
-    text, quality = await engine.transcribe(wav, language)
+    try:
+        wav = b64decode(audio_wav_b64)
+        pcm, sr = wav_to_pcm16(wav)
+        engine = await get_engine(backend or ASR_BACKEND)
+        text, quality = await engine.transcribe(wav, language)
+    except Exception as e:
+        # Never let an exception escape the tool: one raised here tears down
+        # the whole MCP session (anyio's TaskGroup kills it), which took the
+        # agent's ears offline until the bridge happened to reconnect.
+        logger.error(f"transcribe failed: {e}")
+        return {"text": "", "error": f"transcribe failed: {str(e)[:200]}",
+                "audio_secs": 0.0, "server_ms": round(now_ms() - t0, 1)}
     server_ms = now_ms() - t0
     audio_secs = len(pcm) / sr if sr else 0.0
     q = dropped = ""

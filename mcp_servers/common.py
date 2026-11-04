@@ -70,6 +70,36 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def trim_silence(pcm: bytes, sample_rate: int, *, frame_ms: int = 40,
+                 threshold: float = 0.010, pad_ms: int = 120) -> bytes | None:
+    """Cut leading/trailing near-silence from 16-bit mono PCM.
+
+    Spans the VAD hands over (especially around music/TV) carry seconds of
+    quiet tail; uploading them costs ASR time on the free tier and degrades
+    Whisper's quality gate. Frame RMS drives the cut; ~-40 dBFS counts as
+    silence and both ends keep `pad_ms` of margin so no phoneme is clipped.
+
+    Returns the trimmed bytes, or None when there is no speech-level frame
+    at all (callers treat that as silence and skip ASR entirely)."""
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    n = int(sample_rate * frame_ms / 1000)
+    n_frames = len(samples) // n
+    if n_frames < 2:
+        return pcm
+    x = samples[: n_frames * n].astype(np.float32) / 32768.0
+    frames = x.reshape(n_frames, n)
+    rms = np.sqrt((frames * frames).mean(axis=1))
+    loud = np.nonzero(rms >= threshold)[0]
+    if len(loud) == 0:
+        return None
+    pad_frames = int(pad_ms * sample_rate / 1000 / n)
+    start = max(0, int(loud[0]) - pad_frames) * n
+    end = min(n_frames, int(loud[-1]) + pad_frames + 1) * n
+    if start <= 0 and end >= len(samples):
+        return pcm                      # nothing worth cutting
+    return samples[start:end].tobytes()
+
+
 def resample_int16(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     """Linear-interpolation resampler; good enough for speech going into ASR."""
     if src_sr == dst_sr or len(pcm) == 0:

@@ -24,14 +24,17 @@ Metric definitions (all in milliseconds):
                  window, so client_ttfa ≈ server_ttfa + ~200-300 ms.
   asr/llm/tts    the bridge's component breakdown for the turn.
   barge_cut      first byte of interrupting speech sent -> "barge" message
-                 received (the moment the bot's audio is cut).
+                 received (the moment the bot's audio is cut). t_resp is
+                 measured separately: cut -> first response audio.
 
 Scenarios:
 
   no_tool       "Tell me a fun fact about the ocean."   (pure LLM reply)
   tool_time     "What time is it in Manila right now?" (get_time)
   tool_weather  "What's the weather like in Quezon City today?" (get_weather)
-  barge_cut     interrupt the greeting and measure the cut.
+  barge_cut     interrupt the greeting and measure the cut (t_stop) and the
+                response (t_resp, Full-Duplex-Bench v1.5: cut -> first audio
+                of the reply).
 
 Usage:
   .venv/bin/python tests/bench_latency.py --runs 3 --label alice
@@ -101,6 +104,7 @@ class Turn:
         self.t_first_audio = None     # first reply audio byte received
         self.t_last_audio = None      # last reply audio byte received
         self.t_done = None
+        self.t_resp_audio = None    # first response audio after a barge cut
         self.transcript = None
         self.stats = {}
         self.tools = []
@@ -116,10 +120,17 @@ class Turn:
         if self.t_last_audio and self.t_speech_end:
             return (self.t_last_audio - self.t_speech_end) * 1000
 
+    @property
+    def t_resp(self):
+        """Full-Duplex-Bench v1.5: barge cut -> first response audio (ms)."""
+        if self.t_first_audio and self.t_resp_audio:
+            return (self.t_resp_audio - self.t_first_audio) * 1000
+
     def record(self, ok: bool) -> dict:
         return dict(self.__dict__,
                     client_ttfa=self.client_ttfa,
-                    client_total=self.client_total, ok=ok)
+                    client_total=self.client_total,
+                    t_resp=self.t_resp, ok=ok)
 
 
 class Session:
@@ -151,8 +162,9 @@ class Session:
                 elif msg.type == aiohttp.WSMsgType.TEXT:
                     self.inbox.append((time.monotonic(), "json",
                                        json.loads(msg.data)))
-        except Exception:
-            pass
+        except Exception as e:
+            # A dead reader makes every scenario "miss" silently - surface it.
+            print(f"  [reader {self.cid}] died: {e!r}", flush=True)
 
     async def speak(self, pcm: bytes, pad_frames: int = 10) -> float:
         """Stream a phrase as mic input at real-time pace, then the stop pad.
@@ -271,21 +283,44 @@ async def run_benchmark(runs: int, port: int, label: str):
             t_start = time.monotonic()
             cut_at = None
             pcm = wavs["barge"]["pcm"]
-            for j in range(0, len(pcm), FRAME_BYTES):
-                await sess.ws.send_bytes(pcm[j:j + FRAME_BYTES])
+            # Stream the interrupting phrase, then keep the mic alive with
+            # silence frames like a real browser does - the deferred
+            # barge-in (backchannel filtering) cuts a bit after speech
+            # STARTS, so the socket has to keep feeding the VAD.
+            speech_frames = len(pcm) // FRAME_BYTES
+            tail_frames = int(1.5 / PACE)          # ~1.5 s of silence tail
+            for j in range(speech_frames + tail_frames):
+                if j < speech_frames:
+                    await sess.ws.send_bytes(pcm[j * FRAME_BYTES:(j + 1) * FRAME_BYTES])
+                else:
+                    await sess.ws.send_bytes(b"\x00\x00" * FRAME_BYTES)
                 await asyncio.sleep(PACE)
                 for t, kind, m in sess.inbox:
                     if (kind == "json" and m.get("type") == "barge"
                             and t >= t_start):
                         cut_at = t
-                if cut_at:
-                    break
+                # Do NOT break on the cut: the VAD still needs the trailing
+                # silence to CLOSE the span, which is what transcribes it and
+                # fires the response turn (t_resp). Breaking here would starve
+                # the VAD and the reply would never come.
             turn.t_speech_end = t_start
             if cut_at:
                 turn.t_first_audio = cut_at
+                # Full-Duplex-Bench v1.5 t_resp: cut -> first audio of the
+                # response turn (the agent getting back to speaking).
+                resp_at = None
+                dl = time.monotonic() + 15
+                while time.monotonic() < dl and resp_at is None:
+                    for t, kind, m in sess.inbox:
+                        if kind == "audio" and t >= cut_at:
+                            resp_at = t
+                    await asyncio.sleep(0.01)
+                turn.t_resp_audio = resp_at
             turn.error = None if cut_at else "no barge"
             runs_out.append(turn.record(bool(cut_at)))
-            print(f"  [barge_cut #{i + 1}] cut={turn.client_ttfa and round(turn.client_ttfa)}ms"
+            t_resp = (turn.t_resp_audio - cut_at) * 1000 if cut_at and turn.t_resp_audio else None
+            print(f"  [barge_cut #{i + 1}] t_stop={turn.client_ttfa and round(turn.client_ttfa)}ms "
+                  f"t_resp={t_resp and round(t_resp)}ms"
                   f"{' !! ' + str(turn.error) if turn.error else ''}")
             await sess.close()
         results["scenarios"]["barge_cut"] = runs_out
@@ -293,7 +328,7 @@ async def run_benchmark(runs: int, port: int, label: str):
     # --- summary -----------------------------------------------------------
     print("\n=== summary (ms; median / p95) ===")
     print(f"{'scenario':<14}{'n':>3}{'client_ttfa':>20}{'client_total':>20}"
-          f"{'asr':>14}{'llm':>14}{'tts':>12}{'ttfa_srv':>14}")
+          f"{'t_resp':>14}{'asr':>14}{'llm':>14}{'tts':>12}{'ttfa_srv':>14}")
     summary = {}
     for name, runs_out in results["scenarios"].items():
         oks = [r for r in runs_out if r.get("ok") and r.get("client_ttfa")]
@@ -304,8 +339,8 @@ async def run_benchmark(runs: int, port: int, label: str):
             continue
         stats_key = {"asr": "asr_ms", "llm": "llm_ms",
                      "tts": "tts_ms", "ttfa_srv": "ttfa_ms"}
-        for key in ("client_ttfa", "client_total", "asr", "llm", "tts",
-                    "ttfa_srv"):
+        for key in ("client_ttfa", "client_total", "t_resp", "asr", "llm",
+                    "tts", "ttfa_srv"):
             if key in stats_key:
                 vals = [r["stats"][stats_key[key]] for r in oks
                         if r.get("stats", {}).get(stats_key[key]) is not None]
@@ -316,7 +351,8 @@ async def run_benchmark(runs: int, port: int, label: str):
             row[key] = {"p50": round(pct(vals, 50)), "p95": round(pct(vals, 95)),
                         "min": round(min(vals)), "max": round(max(vals))}
         line = f"{name:<14}{len(oks):>3}"
-        for k in ("client_ttfa", "client_total", "asr", "llm", "tts", "ttfa_srv"):
+        for k in ("client_ttfa", "client_total", "t_resp", "asr", "llm",
+                  "tts", "ttfa_srv"):
             r_ = row.get(k, {})
             p50, p95 = r_.get("p50", "-"), r_.get("p95", "-")
             if k in ("client_ttfa", "client_total"):
