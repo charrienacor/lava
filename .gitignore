@@ -17,6 +17,3 @@ logs/*
 
 # Models
 models/
-
-# Tests
-tests/results/

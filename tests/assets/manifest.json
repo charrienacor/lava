@@ -1,9 +1,0 @@
-{
-  "sample_rate": 16000,
-  "phrases": {
-    "no_tool": "Tell me a fun fact about the ocean.",
-    "tool_time": "What time is it in Manila right now?",
-    "tool_weather": "What's the weather like in Quezon City today?",
-    "barge": "Anyway, what about tomorrow then?"
-  }
-}

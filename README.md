@@ -19,7 +19,6 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
 [Talking to it](#talking-to-it) · [Tools](#tools) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
 [Spotify music](#spotify-music) · [Raspberry Pi](#raspberry-pi) ·
-[Latency benchmark](#latency-benchmark) · [Testing](#testing) ·
 [Troubleshooting](#troubleshooting) · [Project layout](#project-layout) ·
 [Security notes](#security-notes)
 
@@ -38,8 +37,8 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
   sentence is finished, so replies start fast.
 - **Robust** — auto-reconnects to its backends, walks an LLM failover chain
   on quota limits, and degrades TTS to a fallback instead of going silent.
-- **Self-measuring** — built-in latency benchmark and live metrics in
-  `/api/status`.
+- **Self-measuring** — live per-turn latency metrics (TTFA, ASR/LLM/TTS
+  breakdown) in `/api/status`.
 
 ---
 
@@ -81,8 +80,8 @@ then starts the three MCP servers and the web bridge. When you see
   loud in a sentence or two.
 - **Interrupt it** by talking while it's answering: it stops immediately and
   listens to what you say next (barge-in).
-- **Going quiet:** after ~25 s of silence it asks *"are you still there?"*
-  (rotating wordings); after ~80 s of total silence the mic turns off. Tap the
+- **Going quiet:** after ~50 s of silence it asks *"are you still there?"*
+  (rotating wordings); after ~70 s of total silence the mic turns off. Tap the
   orb to resume — the conversation is remembered per browser tab for 24 h.
 - **End the session** by tapping the orb while it's live. Tap again to start a
   new one.
@@ -465,105 +464,6 @@ which of several to use.
 
 ---
 
-## Latency benchmark
-
-`tests/bench_latency.py` measures the interaction loop the same way every
-time. It is designed for classroom use: no per-student setup, no modifications,
-and identical stimulus audio for everyone.
-
-```bash
-./run.sh                                        # terminal 1: the stack
-.venv/bin/python tests/bench_latency.py --runs 3 --label your_name
-```
-
-How it stays standardized:
-
-- Stimulus phrases are pre-rendered WAVs in `tests/assets/` (committed to the
-  repo). The benchmark loads them with the stdlib only — no TTS at runtime. If
-  the folder is missing it regenerates once via `tests/generate_assets.py`
-  (needs Piper, which `./run.sh` installs).
-- Every run opens a **fresh session** with a unique id, so results never depend
-  on conversation state.
-- Audio is streamed at real-time pace as binary 32 ms frames — exactly what the
-  browser does — so human speaking variance is removed and runs are comparable
-  across machines and days.
-- Results are written to `tests/results/latency_<label>_<timestamp>.json` with
-  per-turn raw numbers, a summary (median / p95 / min / max), the host name,
-  and the stimuli used — submit that file.
-
-Scenarios: `no_tool` (pure LLM reply), `tool_time` (get_time), `tool_weather`
-(get_weather — the slowest common tool), and `barge_cut` (interrupting the
-greeting and measuring the cut and the response). Each runs `--runs` times and
-also reports the bridge's own component breakdown per turn.
-
-Metric definitions:
-
-- **client_ttfa** — last mic-speech byte sent → first reply-audio byte
-  received. What a user perceives: VAD end-of-speech detection (~0.2 s) + ASR +
-  first clause + first TTS chunk + transport.
-- **client_total** — speech end → the whole reply streamed.
-- **server ttfa_ms** — the bridge's own measure (turn start → first audio
-  streamed). Expect `client_ttfa ≈ server ttfa_ms + 0.2–0.3 s`.
-- **t_stop** (barge_cut) — first byte of interrupting speech → the bot's audio
-  is cut (~0.8 s measured; the VAD must first accumulate `VAD_BARGE_MS` of
-  gated speech over the bot's own audio). Full-Duplex-Bench v1.5's *stop
-  latency*; the paper's best systems (GPT-4o) hit ~0.2 s, ours trades a little
-  of that for backchannel filtering.
-- **t_resp** (barge_cut) — cut → first audio of the response turn. The paper's
-  *response latency*: how fast the agent gets back to speaking after yielding.
-
-### Reading the output
-
-```text
-=== summary (ms; median / p95) ===
-scenario        n         client_ttfa        client_total          t_resp           asr           llm         tts      ttfa_srv
-no_tool         3       1440/   2217       1563/   2291               -             489           891           168          1409
-tool_time       3       1825/   1936       1826/   1936               -             412          1381             0          1794
-tool_weather    3       3995/   4384       4103/   4501               -             581          3635           157          4110
-barge_cut       3         788/    788          -/      -        2100/   2600             -             -             -             -
-```
-
-- **n** successful runs. **median/p95** = typical run / worst run — a p95 far
-  above the median is jitter (weak WiFi or a throttled free tier), not a code
-  problem.
-- **client_ttfa** is the number a user feels: finished speaking → first reply
-  audio. **ttfa_srv** measures the same event server-side; the small gap
-  between them (~30–300 ms) is the VAD stop-detection plus transport — their
-  agreement is the sanity check that both clocks are correct.
-- **asr / llm / tts** attribute the time: `asr` isolates the network leg
-  (upload + round trips), `llm` covers Groq generation *and tool waits*
-  (weather turns are slow because the weather API is slow, not the LLM), `tts`
-  is local Piper CPU — expect it to rise sharply on a Pi.
-- `barge_cut` has no component columns: a barge is not a turn, just VAD
-  detection + the cut.
-
-Reference numbers (Mac laptop, wired WiFi, free tier): no_tool ≈ 1.4 s,
-tool_time ≈ 1.8 s, tool_weather ≈ 4 s, barge_cut ≈ 0.8 s. Compare rows, not
-machines: `client_ttfa` for overall feel, `asr` for network quality, `tts` for
-local CPU.
-
-Uses a few Groq calls per run — keep `--runs` modest on the free tier.
-
----
-
-## Testing
-
-Unit tests are standalone scripts — no pytest, no servers, no network. Run any
-of them directly:
-
-```bash
-.venv/bin/python tests/test_music_parser.py    # fast-path music command parser
-.venv/bin/python tests/test_backchannel.py     # deferred barge-in backchannel classifier
-.venv/bin/python tests/test_fullduplex.py      # Full-Duplex-Bench overlap classification
-```
-
-They import `web.server` (which loads `.env`) and exercise the pure logic —
-the music command parser, the backchannel classifier, and the overlap
-scenarios — with the relevant mode forced on. Add a case to the relevant
-`CASES` list to extend coverage.
-
----
-
 ## Troubleshooting
 
 - **`Address already in use` on :8080** — a stale bridge holds the port.
@@ -610,8 +510,7 @@ lava/
 ├── mcp_servers/            # asr_server, tts_server, tools_server, spotify, common
 ├── web/                    # server.py (bridge + VAD + orchestration), index.html (orb UI)
 ├── models/piper/           # Piper voice, auto-downloaded on first use
-├── logs/                   # <name>.log (rotated), <name>.pid, notes.json, spotify_token.json
-└── tests/                  # standalone unit tests + bench_latency.py + assets/
+└── logs/                   # <name>.log (rotated), <name>.pid, notes.json, spotify_token.json
 ```
 
 HTTP/WebSocket endpoints served by the bridge (`:8080`):
