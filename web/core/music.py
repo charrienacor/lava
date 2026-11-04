@@ -91,7 +91,8 @@ def parse_music_command(text: str) -> dict | None:
     # otherwise block ("play it one more time").
     if re.match(
         r"^(restart|rewind|start (this )?(song )?(over|again|from the beginning)"
-        r"|beginning|play it (again|from the (top|start|beginning))|one more time)\b",
+        r"|beginning|play it (again|one more time|from the (top|start|beginning))"
+        r"|one more time)\b",
         t,
     ):
         return {"tool": "music_restart", "args": {}}
@@ -152,6 +153,15 @@ def parse_music_command(text: str) -> dict | None:
         musicish = re.search(r"\b(song|track|music|spotify|tune|one|this|it)\b", t)
         if musicish or len(t.split()) == 1:  # bare "next"/"skip"; not "next Tuesday"
             return {"tool": "music_skip", "args": {"direction": "next"}}
+    # "play the next song" / "move to the next" mean SKIP, not play a track
+    # literally named "Next Song" - the log caught music_play searching for
+    # it. These phrasings never carry a real track title.
+    if re.match(
+        r"^(?:play|put on|move to|go to|switch to|jump to|take me to) "
+        r"(?:the |my )?next\b",
+        t,
+    ):
+        return {"tool": "music_skip", "args": {"direction": "next"}}
 
     # resume / bare play ---------------------------------------------------
     if re.match(
@@ -160,18 +170,37 @@ def parse_music_command(text: str) -> dict | None:
         return {"tool": "music_resume", "args": {}}
 
     # volume ---------------------------------------------------------------
-    dir_up = re.search(
-        r"\b(louder|loud|higher|boost|blare|blast|crank|up)\b", t
-    ) and not re.match(r"^up\s*to\b", t)
-    dir_down = re.search(
-        r"\b(quieter|quiet|softer|soft|lower|down|dip)\b", t
-    ) and not re.match(r"^down\s*to\b", t)
+    # Direction words come in two strengths. Strong words ("louder", "crank")
+    # are unambiguous anywhere in the utterance. Bare "up"/"down"/"higher"
+    # are common LYRIC words ("wake me up, wake me up", "take me down to the
+    # river", "take me higher") - they only count as a volume command when
+    # paired with a volume idiom ("turn it up", "bring the volume down",
+    # "up the music"). Verbs are limited to volume idioms: "take"/"set" are
+    # far too common in speech and lyrics ("take me down", "set it up").
+    vol_verb = r"\b(turn|bring|push|dial)\b"
+    vol_obj = r"\b(volume|music|sound)\b"
+    dir_up = bool(
+        re.search(r"\b(louder|boost|blare|blast|crank)\b", t)
+        or (
+            re.search(r"\b(up|higher)\b", t)
+            and re.search(vol_verb + "|" + vol_obj, t)
+        )
+        or (re.search(r"\braise\b", t) and re.search(vol_obj, t))
+    )
+    dir_down = bool(
+        re.search(r"\b(quieter|softer|lower|dip)\b", t)
+        or (
+            re.search(r"\bdown\b", t)
+            and re.search(vol_verb + "|" + vol_obj, t)
+        )
+    )
+    vol_word = "volume" in t.split()
     if (
-        num
+        vol_word
         or dir_up
         or dir_down
         or re.search(r"\b(max|maximum|full|mute|silent)\b", t)
-        or "volume" in t.split()
+        or (num and (dir_up or dir_down))
     ):
         if re.search(r"\bmute\b|\bsilent\b", t):
             level = "mute"

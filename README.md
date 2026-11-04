@@ -292,6 +292,13 @@ LLM round trip. Anything the parser is not sure about falls through to the
 normal LLM path, and volume numbers inside a music command ("turn it up by 40")
 are relative, while "up to 40" is absolute.
 
+The parser is tuned against real logs, not just the happy path: "play the
+next song" / "move to the next" map to skip (letting them through made
+Spotify search for a track literally named "Next Song"), and bare "up" /
+"down" / "higher" only count as volume commands inside a volume idiom
+("turn it up", "bring the volume down", "up the music") — strong words like
+"louder" or "crank" work anywhere, but "wake me up" is a lyric, not a command.
+
 ### Idle handling
 
 `idle_watch` tracks real voice, not raw frames. After `IDLE_PROMPT_SECS`
@@ -498,6 +505,9 @@ which of several to use.
 
 - Lint with `ruff check` (rules pinned in `ruff.toml` — the codebase is clean
   against exactly that set).
+- Regression-test the music fast-path parser (no servers needed):
+  `.venv/bin/python tests/test_music_parser.py` — 75 cases covering real log
+  transcripts, lyric traps, and every music command.
 - Run the bridge with the MCP servers already up:
   `.venv/bin/python -m web.server`, or the one-shot `./run.sh`.
 - Logs: `logs/<name>.log` (asr, tts, tools, web — rotated at 10 MB, 3 days
@@ -545,6 +555,7 @@ which of several to use.
 lava/
 ├── run.sh                  # one-shot launcher (recommended)
 ├── requirements.txt        # Python dependencies
+├── ruff.toml               # lint rules (codebase is clean against this set)
 ├── .env                    # all configuration (git-ignored — holds API keys)
 ├── deploy/
 │   ├── start_all.sh        # starts the three MCP servers only
@@ -554,6 +565,8 @@ lava/
 │   ├── server.py           # entry point: HTTP/WebSocket routes + lifecycle
 │   ├── core/               # config, state, mcp_client, llm, vad, speech, music, turn
 │   └── index.html          # orb UI
+├── tests/
+│   └── test_music_parser.py  # regression suite for the music fast-path parser
 ├── models/piper/           # Piper voice, auto-downloaded on first use
 └── logs/                   # <name>.log (rotated), <name>.pid, notes.json, spotify_token.json
 ```
