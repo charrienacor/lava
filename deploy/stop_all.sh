@@ -64,8 +64,17 @@ done
 # --- 3) Verify ports are free -----------------------------------------------
 # Uses nc (no lsof dependency). A port is "free" when a TCP connect is refused.
 
+# Python socket connect, not `nc -z -G` (the -G flag is BSD/macOS netcat only;
+# Raspberry Pi OS's netcat-traditional rejects it). See start_all.sh.
 port_listening() {
-    nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1
+    python3 - "$1" <<'PYEOF' >/dev/null 2>&1
+import socket, sys
+s = socket.socket(); s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except Exception:
+    sys.exit(1)
+PYEOF
 }
 
 sleep 1

@@ -45,8 +45,21 @@ mkdir -p "$LOGS"
 # bridge's supervisor comment in web/core/mcp_client.py warns about).
 # "Port up but app not ready" is fine: the bridge's MCPConn
 # auto-reconnects every 2 s until the handshake succeeds.
+#
+# Port check is a plain Python socket connect, NOT `nc -z -G`: the -G flag is
+# BSD/macOS netcat only, and Raspberry Pi OS ships netcat-traditional, which
+# rejects it (so the check would always fail and the servers would be reported
+# as "not coming up" even when they are). Python is guaranteed present (it is
+# the runtime), so this is portable across both hosts.
 port_open() {
-    nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1
+    python3 - "$1" <<'PYEOF' >/dev/null 2>&1
+import socket, sys
+s = socket.socket(); s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except Exception:
+    sys.exit(1)
+PYEOF
 }
 
 wait_mcp_ready() {  # <port> <name> <seconds>

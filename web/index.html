@@ -446,6 +446,58 @@ const LIMB = new Float32Array(N_PX);       // z^0.42
   }
 }
 
+// ---------- face ----------
+// The expression is folded into the same metaball field as the lava: two
+// small almond glows for the eyes and one longer molten seam for the mouth.
+// Geometry lives in view space (vx/vy), so the face keeps facing the camera
+// while the lava spins under it, and each feature is weighted by the field
+// already beneath it (see renderPlanet) so the face ignites where the
+// surface is hot - part of the planet, never a sticker on it.
+const FACE_MY = 0.21;                      // mouth rest height (disc spans [-1, 1])
+const FACE_MW = 0.34;                      // mouth half-width
+const FACE_MINV = 1 / (2 * 0.046 * 0.046); // seam half-thickness
+const EYE_X = 0.255, EYE_Y = -0.15;
+const EYE_WI = 1 / (2 * 0.088 * 0.088);
+const EYE_HI = 1 / (2 * 0.054 * 0.054);
+const EYE_HIn = 1 / (2 * 0.014 * 0.014);   // squinted: eyes almost shut
+const FMASK = new Uint8Array(N_PX);        // 1 inside the face's bounding box
+const MSH = new Float32Array(N_PX);        // mouth envelope (tapers at the corners)
+const EYEA = new Float32Array(N_PX);       // eyes open
+const EYEB = new Float32Array(N_PX);       // eyes squinted (blend target)
+{
+  const R0 = RES / 2;
+  let i = 0;
+  for (let y = 0; y < RES; y++) {
+    const vy = (y - R0 + 0.5) / R0;
+    for (let x = 0; x < RES; x++, i++) {
+      const vx = (x - R0 + 0.5) / R0;
+      if (vx * vx + vy * vy > 1) continue;
+      if (vx > 0.42 || vx < -0.42 || vy < -0.32 || vy > 0.44) continue;
+      FMASK[i] = 1;
+      const u = 1 - (vx / FACE_MW) * (vx / FACE_MW);
+      MSH[i] = u > 0 ? u : 0;
+      const dy = vy - EYE_Y;
+      const dR = (vx - EYE_X) * (vx - EYE_X), dL = (vx + EYE_X) * (vx + EYE_X);
+      EYEA[i] = Math.max(Math.exp(-(dR * EYE_WI + dy * dy * EYE_HI)),
+                         Math.exp(-(dL * EYE_WI + dy * dy * EYE_HI)));
+      EYEB[i] = Math.max(Math.exp(-(dR * EYE_WI + dy * dy * EYE_HIn)),
+                         Math.exp(-(dL * EYE_WI + dy * dy * EYE_HIn)));
+    }
+  }
+}
+
+// Expression per connection phase: curve > 0 dips the seam's center into a
+// smile, < 0 arches it into a frown; amp is the seam's heat, eye the glow of
+// the eyes, squint narrows them (concern; blinks ride on top of it).
+const FACE_EXPR = {
+  online:   { curve:  0.078, amp: 0.205, eye: 0.130, squint: 0.08 },
+  retrying: { curve:  0.012, amp: 0.125, eye: 0.100, squint: 0.48 },
+  offline:  { curve: -0.055, amp: 0.105, eye: 0.088, squint: 0.20 },
+};
+let connPhase = "offline";  // offline | retrying | online (drives the face)
+const FP = { curve: -0.055, amp: 0.105, eye: 0.088, squint: 0.20 };
+let blinkAt = -9, nextBlink = 2 + Math.random() * 3;
+
 let rotAngle = 0;
 let speechLevel = 0;  // smoothed TTS playback RMS -> speaking swells
 let micLevel = 0;     // smoothed mic RMS -> listening bulge
@@ -473,6 +525,23 @@ function renderPlanet(t, dt) {
   speechLevel += (sl - speechLevel) * (sl > speechLevel ? 0.55 : 0.10);
   const ml = (state === "listening" && running) ? currentLevel() : 0;
   micLevel += (ml - micLevel) * (ml > micLevel ? 0.45 : 0.08);
+
+  // --- expression: ease toward the connection phase's face ---
+  const FT = FACE_EXPR[connPhase] || FACE_EXPR.offline;
+  const fs = Math.min(1, dt * 1.7);
+  FP.curve  += (FT.curve  - FP.curve)  * fs;
+  FP.amp    += (FT.amp    - FP.amp)    * fs;
+  FP.eye    += (FT.eye    - FP.eye)    * fs;
+  FP.squint += (FT.squint - FP.squint) * fs;
+  // an occasional blink keeps the face alive; it rides on the squint blend
+  if (t >= nextBlink) { blinkAt = t; nextBlink = t + 3.5 + Math.random() * 3.5; }
+  const bph = t - blinkAt;
+  const blink = (bph >= 0 && bph < 0.26) ? Math.sin(Math.PI * bph / 0.26) : 0;
+  const fSquint = Math.min(1, FP.squint + blink);
+  const fCurve = FP.curve + 0.01 * Math.sin(t * 0.45);   // gentle mood drift
+  const fAmp = FP.amp * (0.86 + 0.14 * Math.sin(t * 0.9))   // seam shimmer
+             + (state === "speaking" ? 0.2 * speechLevel : 0); // talk flare
+  const fEye = FP.eye + (state === "listening" ? 0.05 * Math.min(1, micLevel) : 0);
 
   // --- blob positions in the planet frame ---
   const eOrb = Math.min(1, P.energy + (state === "listening" ? 0.35 * micLevel : 0));
@@ -528,6 +597,17 @@ function renderPlanet(t, dt) {
     if (bulgeAmp > 0.01) {
       const dx = ux - bBx, dy = uy - bBy, dz = uz - bBz;
       F += bulgeAmp * Math.exp(-(dx * dx + dy * dy + dz * dz) * 3.2);
+    }
+    // ---- expression: eyes + seam mouth, weighted by the field already
+    // under them so the face ignites with the surface instead of sitting
+    // on top of it ----
+    if (FMASK[i]) {
+      const heat = 0.7 + 0.45 * (F < 1 ? F : 1);
+      const m = MSH[i];
+      const d = vy - FACE_MY - fCurve * m;
+      F += fAmp * m * heat * Math.exp(-d * d * FACE_MINV);
+      const ea = EYEA[i], eb = EYEB[i];
+      F += fEye * heat * (ea + (eb - ea) * fSquint);
     }
     F *= 0.86;
     let ci = (F * 255) | 0;
@@ -766,12 +846,14 @@ function duckBot(on) {
 
 // ---------------- websocket ----------------
 function connect() {
+  connPhase = "retrying";  // concerned face while attempting
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws?cid=${encodeURIComponent(client_id)}`);
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
     reconnectTries = 0;
+    connPhase = "online";  // the smile arrives with the connection
     startMic();
   };
 
@@ -840,6 +922,7 @@ function connect() {
       // next tap resumes the same conversation (the server keeps it by cid).
       if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       running = false;
+      connPhase = "offline";
       stopMic();
       stopBotAudio();
       if (ws) { ws.onclose = null; ws.close(); ws = null; }
@@ -859,8 +942,15 @@ function connect() {
       // page was reloaded.
       if (reconnectTries < 20) {
         reconnectTries += 1;
+        connPhase = "retrying";
+        stateLabel.textContent = "reconnecting";
+        stateLabel.classList.remove("hide");
         setTimeout(connect, 1500);
+      } else {
+        connPhase = "offline";
       }
+    } else if (reconnectTries === 0) {
+      connPhase = "offline";  // first attempt never opened; back to rest
     }
   };
   ws.onerror = () => ws.close();
@@ -905,6 +995,7 @@ async function startMic() {
     });
   } catch (e) {
     running = false;
+    connPhase = "offline";
     setState("idle");
     showMicBanner(e);
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
@@ -1005,6 +1096,7 @@ orbWrap.addEventListener("click", () => {
     connect();
   } else {
     running = false;
+    connPhase = "offline";
     stopMic();
     stopBotAudio();
     if (ws) { ws.onclose = null; ws.close(); ws = null; }

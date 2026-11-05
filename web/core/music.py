@@ -279,12 +279,14 @@ def _voice_of_track(line: str) -> str:
     return (line or "").strip()
 
 
-def _web_player_note(name: str) -> str:
-    return (
-        ", in the Spotify web player tab"
-        if "web player" in (name or "").lower()
-        else ""
-    )
+def _device_phrase(name: str) -> str:
+    """Where playback lives, spoken as part of the confirmation.
+
+    Just the device name - "on MacBook Pro", "on Pi", "on Web Player
+    (Chrome)" - with no advice attached. The tools server's LLM-facing
+    note still carries the web-player caveats when the LLM answers."""
+    n = (name or "").strip()
+    return f" on {n}" if n else ""
 
 
 def _music_error_speech(err: str) -> str:
@@ -319,7 +321,7 @@ def _music_reply(tool: str, args: dict, res: dict) -> str:
     err = res.get("error")
     if err:
         return _music_error_speech(err)
-    webn = _web_player_note(res.get("device", ""))
+    dev = _device_phrase(res.get("device", ""))
     if tool == "music_pause":
         return "Nothing was playing." if res.get("paused") is False else "Paused."
     if tool == "music_resume":
@@ -329,7 +331,7 @@ def _music_reply(tool: str, args: dict, res: dict) -> str:
     if tool == "music_skip":
         tr = _voice_of_track(res.get("playing", "")) if res.get("playing") else ""
         return (
-            f"Now on {tr}{webn}."
+            f"Now on {tr}{dev}."
             if tr
             else "Back a track."
             if args.get("direction") == "previous"
@@ -338,8 +340,8 @@ def _music_reply(tool: str, args: dict, res: dict) -> str:
     if tool == "music_play":
         tr = _voice_of_track(res.get("playing", ""))
         if not tr or tr.lower() == "started":
-            return "Playback started."
-        return f"Playing {tr}{webn}."
+            return f"Playback started{dev}."
+        return f"Playing {tr}{dev}."
     if tool == "music_queue":
         return f"Queued {res.get('queued', 'that')}."
     if tool == "music_volume":
@@ -359,7 +361,7 @@ def _music_reply(tool: str, args: dict, res: dict) -> str:
             return "Nothing is playing right now."
         name = _voice_of_track(res["playing"])
         return (
-            f"{name} is paused." if res.get("paused") else f"Now playing {name}{webn}."
+            f"{name} is paused." if res.get("paused") else f"Now playing {name}{dev}."
         )
     if tool == "music_devices":
         devs = res.get("devices") or []

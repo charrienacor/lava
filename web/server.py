@@ -42,6 +42,7 @@ from web.core.config import (
     MUSIC_POLL_IDLE_MAX,
     SPOTIFY_REDIRECT_URI,
     SYSTEM_PROMPT,
+    WEB_HOST,
     WEB_PORT,
 )
 from web.core.mcp_client import asr_conn, load_tools, tools_conn, tts_conn
@@ -485,4 +486,4 @@ def make_app() -> web.Application:
 
 if __name__ == "__main__":
     setup_logging("web")
-    web.run_app(make_app(), host="127.0.0.1", port=WEB_PORT)
+    web.run_app(make_app(), host=WEB_HOST, port=WEB_PORT)

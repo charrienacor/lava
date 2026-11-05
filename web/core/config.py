@@ -5,15 +5,54 @@ module can pull its constants from here without risk of a cycle.
 """
 
 import os
+import re
+import socket
 from pathlib import Path
 
 from dotenv import load_dotenv
+from loguru import logger
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 
+def _profile_from_hostname() -> str:
+    """Best-effort Pi detection from the hostname (raspberrypi, pi, pi-4, ...)."""
+    host = (socket.gethostname() or "").lower()
+    return (
+        "pi"
+        if (
+            "raspberry" in host
+            or host == "pi"
+            or host.startswith("pi-")
+            or host.endswith("-pi")
+            or re.fullmatch(r"pi\d+", host) is not None
+        )
+        else "desktop"
+    )
+
+
+# Deployment profile: "pi" or "desktop". Auto-detected from the hostname by
+# default; set LAVA_DEVICE in .env to force it. Drives device-specific advice
+# (a headless Pi has no Spotify desktop app to open - the fix there is a
+# Connect receiver), so it lives here where BOTH processes read it: the web
+# bridge speaks the warnings, the tools server writes the LLM-facing notes.
+DEVICE_PROFILE = (
+    os.getenv("LAVA_DEVICE", "").strip().lower() or _profile_from_hostname()
+)
+if DEVICE_PROFILE not in ("pi", "desktop"):
+    logger.warning(
+        "Unknown LAVA_DEVICE={!r} - using 'desktop'. Valid: pi, desktop.",
+        DEVICE_PROFILE,
+    )
+    DEVICE_PROFILE = "desktop"
+
+
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+# Bind host for the web bridge. Default 127.0.0.1 (loopback only — the safe
+# choice). Set 0.0.0.0 on a headless Raspberry Pi so a browser on the same LAN
+# can reach the UI directly; otherwise tunnel with `ssh -L 8080:localhost:8080`.
+WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-20b")
 # Fallback chain, tried in order: Groq's daily quota is per model, so the

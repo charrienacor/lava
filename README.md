@@ -7,7 +7,7 @@ you go quiet, it asks if you're still there before turning the mic off.
 
 Everything runs on free services: speech recognition and the brain are on
 Groq's free tier, the voice (Piper) is fully local. Developed on a laptop
-(macOS), built for a Raspberry Pi. Python ≥ 3.12.
+(macOS), built for a Raspberry Pi. Python ≥ 3.11 (stock Raspberry Pi OS is fine).
 
 ```
 browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [tools :8003]) ──▶ [TTS :8002] ──▶ browser speaker
@@ -48,7 +48,7 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
 
 **Prerequisites**
 
-- Python ≥ 3.12 (a virtualenv is created for you)
+- Python ≥ 3.11 (a virtualenv is created for you)
 - A free Groq API key — https://console.groq.com/keys (the free tier is
   enough; it powers both Whisper ASR and the LLM)
 - Optional: a Spotify app and a Premium account for music control
@@ -420,6 +420,7 @@ most likely to touch first:
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | From a Spotify app (developer.spotify.com). Required by every music tool; search additionally works before the one-time account link |
 | `SPOTIFY_REDIRECT_URI` | `http://127.0.0.1:8080/callback` | Must match the app's redirect URI exactly |
 | `MUSIC_VOLUME_STEP` | `10` | Steps for direction-only volume words ("louder" = +10, "quieter" = −10) |
+| `LAVA_DEVICE` | auto (`pi` / `desktop`) | Deployment profile — auto-detected from the hostname; set `pi` on a Raspberry Pi to get Pi-appropriate advice (a headless Pi has no Spotify desktop app, so web-player warnings point to a Connect receiver instead) |
 
 **Idle & infrastructure**
 
@@ -428,6 +429,7 @@ most likely to touch first:
 | `IDLE_PROMPT_SECS` / `IDLE_CHECK_SECS` | `50` / `70` | Check-in after this much quiet / mic off after this much total silence |
 | `DEFAULT_CITY` / `DEFAULT_TIMEZONE` | `Quezon City` / `Asia/Manila` | Time, weather, and identity |
 | `MCP_HOST` | `127.0.0.1` | Bind host for the three MCP servers |
+| `WEB_HOST` | `127.0.0.1` | Bind host for the web bridge. Leave as-is on a laptop; set `0.0.0.0` on a headless Pi so a LAN browser reaches the UI (otherwise tunnel with `ssh -L 8080:localhost:8080`) |
 | `ASR_PORT` / `TTS_PORT` / `TOOLS_PORT` | `8001` / `8002` / `8003` | MCP server ports |
 | `WEB_PORT` | `8080` | Bridge port |
 | `MODELS_DIR` | `./models` | Where the Piper voice is stored |
@@ -441,9 +443,11 @@ volume, shuffle, repeat, now-playing and device listing (plus an internal
 `music_state` mirror the bridge polls — not a command).
 
 - **Play** — "play Bohemian Rhapsody", "play the album X", "play the playlist
-  Y". The reply names the track *and the device it landed on*, and warns you
-  when that device is a browser tab (the web player plays inside a tab — bring
-  it forward and check its mute button).
+  Y". The spoken reply names the track *and the device it landed on* ("Playing
+  Bohemian Rhapsody, by Queen, on MacBook Pro.") — no extra commentary. When
+  that device is a browser tab, the LLM-facing note still carries the
+  web-player caveats (it pauses on tab focus loss; on a Pi the fix is a
+  Connect receiver, since a headless Pi has no desktop app).
 - **Stop / pause / resume** — "stop the music", "pause", "go ahead".
 - **Skip** — "next song" / "previous" / "last one". Spotify silently ignores
   next/prev when the queue is empty (always, right after a single track), so
@@ -484,8 +488,22 @@ which of several to use.
 
 ## Raspberry Pi
 
+Verified for a Pi 4 (4 GB): the four processes (three MCP servers + the web
+bridge) use ~0.5 GB RAM in total, and every dependency ships an aarch64 wheel,
+so `./run.sh` installs and runs as-is on Raspberry Pi OS (64-bit, Python 3.11).
+
 - Copy the project folder **without** `.venv/` (virtualenvs don't survive a
   copy); `./run.sh` rebuilds it on the Pi.
+- Set `LAVA_DEVICE=pi` in the Pi's `.env` — it makes Spotify device advice
+  Pi-appropriate (a headless Pi has no desktop app; the fix for web-player
+  playback is a Connect receiver). Auto-detection from the hostname usually
+  gets it right, but the key removes any doubt.
+- **Headless access** — the bridge binds `127.0.0.1` by default, so a browser
+  on another device can't reach it directly. Either set `WEB_HOST=0.0.0.0` in
+  the Pi's `.env` (UI then served on the Pi's LAN IP, e.g.
+  `http://192.168.1.50:8080`) or tunnel: `ssh -L 8080:localhost:8080 pi@<ip>`
+  and open `http://127.0.0.1:8080`. The Spotify auth link
+  (`/spotify/auth`) is reached the same way.
 - **Piper is the bottleneck, not the VAD.** `-medium` voices have RTF ≈ 0.5–1
   on a Pi 4. The pipelined Speaker hides most of it behind playback, but for
   snappier first audio set `PIPER_LENGTH_SCALE=0.9`, or switch `PIPER_VOICE` to
@@ -503,11 +521,6 @@ which of several to use.
 
 ## Development
 
-- Lint with `ruff check` (rules pinned in `ruff.toml` — the codebase is clean
-  against exactly that set).
-- Regression-test the music fast-path parser (no servers needed):
-  `.venv/bin/python tests/test_music_parser.py` — 75 cases covering real log
-  transcripts, lyric traps, and every music command.
 - Run the bridge with the MCP servers already up:
   `.venv/bin/python -m web.server`, or the one-shot `./run.sh`.
 - Logs: `logs/<name>.log` (asr, tts, tools, web — rotated at 10 MB, 3 days
@@ -555,7 +568,6 @@ which of several to use.
 lava/
 ├── run.sh                  # one-shot launcher (recommended)
 ├── requirements.txt        # Python dependencies
-├── ruff.toml               # lint rules (codebase is clean against this set)
 ├── .env                    # all configuration (git-ignored — holds API keys)
 ├── deploy/
 │   ├── start_all.sh        # starts the three MCP servers only
@@ -565,8 +577,6 @@ lava/
 │   ├── server.py           # entry point: HTTP/WebSocket routes + lifecycle
 │   ├── core/               # config, state, mcp_client, llm, vad, speech, music, turn
 │   └── index.html          # orb UI
-├── tests/
-│   └── test_music_parser.py  # regression suite for the music fast-path parser
 ├── models/piper/           # Piper voice, auto-downloaded on first use
 └── logs/                   # <name>.log (rotated), <name>.pid, notes.json, spotify_token.json
 ```
@@ -593,6 +603,7 @@ HTTP/WebSocket endpoints served by the bridge (`:8080`):
   (`logs/*`, with only `notes.json` re-included). Treat the file like a
   password.
 - **`logs/notes.json`** is the one tracked log file (your saved notes).
-- The web bridge binds `127.0.0.1` unconditionally; the three MCP servers
-  bind `MCP_HOST` (default `127.0.0.1`). Nothing is exposed to the network
-  unless you change `MCP_HOST` / the ports.
+- The web bridge binds `WEB_HOST` (default `127.0.0.1` — loopback only); the
+  three MCP servers bind `MCP_HOST` (default `127.0.0.1`). Nothing is exposed
+  to the network unless you set `WEB_HOST=0.0.0.0` (headless Pi) or change
+  `MCP_HOST` / the ports.

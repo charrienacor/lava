@@ -34,6 +34,7 @@ from mcp.server.mcpserver import MCPServer
 
 from mcp_servers import spotify
 from mcp_servers.common import ROOT, setup_logging
+from web.core.config import DEVICE_PROFILE
 
 HOST = os.getenv("MCP_HOST", "127.0.0.1")
 PORT = int(os.getenv("TOOLS_PORT", "8003"))
@@ -536,16 +537,48 @@ def _is_browser_device(name: str) -> bool:
     )
 
 
-def _device_hint(name: str) -> str:
-    """Voice-friendly hint when playback lands somewhere users overlook."""
-    if _is_browser_device(name):
-        return (
-            "Playing in the Spotify WEB PLAYER browser tab - it pauses "
-            "whenever that tab loses focus, so the music stops on its own "
-            "as soon as the user switches away. Suggest opening the "
-            "Spotify desktop app instead; also check the tab's mute button."
+def _on_raspberry_pi() -> bool:
+    """True when Lava runs on a Pi (shared profile - see web/core/config)."""
+    return DEVICE_PROFILE == "pi"
+
+
+def _device_hint(name: str, devices: list | None = None) -> str:
+    """Voice-friendly hint when playback lands somewhere users overlook.
+
+    `devices` is the full /me/player/devices list when the caller has it:
+    it decides whether the remedy is "switch to the other device" (a
+    non-browser device exists) or "there is no better device here" - and on
+    a Pi the latter means installing a Connect receiver, not opening a
+    desktop app a headless Pi has no screen for."""
+    if not _is_browser_device(name):
+        return ""
+    base = (
+        "Playing in the Spotify WEB PLAYER browser tab - it pauses "
+        "whenever that tab loses focus, so the music stops on its own "
+        "as soon as the user switches away. "
+    )
+    others = [
+        d["name"]
+        for d in (devices or [])
+        if d.get("name") and not _is_browser_device(d["name"])
+    ]
+    if others:
+        return base + (
+            f"A non-browser device is available ({', '.join(others)}) - "
+            "suggest moving playback there, or opening the Spotify desktop "
+            "app; also check the tab's mute button."
         )
-    return ""
+    if _on_raspberry_pi():
+        return base + (
+            "No other device is connected. On this Raspberry Pi the fix is "
+            "to install a Spotify Connect receiver (Spotify Soloist) so the "
+            "Pi itself becomes a device - see the README's Raspberry Pi "
+            "section. Opening a desktop app is not possible on a headless Pi."
+        )
+    return base + (
+        "No other device is connected - suggest opening the Spotify desktop "
+        "app on this computer; also check the tab's mute button."
+    )
 
 
 # Playback state cache. The bridge polls music_state in its 1 Hz infra loop,
