@@ -1,0 +1,28 @@
+# Home Assistant for the Raspberry Pi - the recommended way to run the
+# virtual smart-home hub next to Lava (Docker is the supported HA install
+# on Linux; it keeps HA isolated from Lava's Python venv and easy to update).
+#
+#   cd deploy/home-assistant
+#   docker compose up -d
+#
+# Then:
+#   1. open http://<pi-ip>:8123, create the admin account (any password)
+#   2. mint a token: Profile -> Security -> Long-Lived Access Tokens
+#   3. add to the repo .env:
+#        HASS_URL=http://<pi-ip>:8123
+#        HASS_TOKEN=<the token>
+#   4. restart the tools MCP:  ./deploy/stop_all.sh && ./deploy/start_all.sh
+#
+# The virtual light + thermostat entities come from ../ha/configuration.yaml
+# (mounted below) - the same file the dev-machine setup uses.
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: lava-ha
+    volumes:
+      - ../../ha/data:/config
+      - ../../ha/configuration.yaml:/config/configuration.yaml:ro
+    ports:
+      - "8123:8123"
+    restart: unless-stopped

@@ -1,0 +1,144 @@
+# Home Assistant configuration for the Lava smart-home demo.
+#
+# Virtual devices only - no physical hardware. Every entity is editable live
+# on the dashboard (Overview page), so you can watch the cards change while
+# talking to the voice agent:
+#
+#   light.living_room        dimmable + colour-capable virtual light
+#   light.kitchen            second dimmable light (multi-room testing)
+#   climate.living_room      virtual thermostat (generic_thermostat):
+#                            - "current" temperature comes from
+#                              input_number.thermostat_current (editable on
+#                              the dashboard to simulate the room warming)
+#                            - "set to 22" moves the target, which shows on
+#                              the thermostat card instantly
+#
+# NOTE on versions: this targets HA 2026.x, where the old `template` climate
+# platform was removed - so the thermostat is a `generic_thermostat` reading
+# an input_number, which is the supported way to make a virtual one.
+#
+# Dashboard: http://127.0.0.1:8123
+#
+# HA binds 0.0.0.0:8123 by default (required for the Docker setup, where the
+# port mapping reaches the container's non-loopback address). On a dev
+# machine, restrict it to this machine by uncommenting:
+#
+# http:
+#   host: 127.0.0.1
+
+default_config:
+
+# --- virtual lights (template platform: no hardware needed) -----------------
+# 2026.x template-light schema: brightness = level_template/set_level
+# (receives `{{ brightness }}`, 0-255). Colour is accepted by the tools but
+# not tracked by this demo config (the 2026.x template-light colour schema is
+# fiddly); on/off + dimming + thermostat are the demonstrated paths.
+light:
+  - platform: template
+    lights:
+      living_room:
+        friendly_name: "Living Room Light"
+        unique_id: lava_light_living_room
+        value_template: "{{ states('input_boolean.living_room_power') }}"
+        turn_on:
+          service: input_boolean.turn_on
+          data:
+            entity_id: input_boolean.living_room_power
+        turn_off:
+          service: input_boolean.turn_off
+          data:
+            entity_id: input_boolean.living_room_power
+        level_template: "{{ states('input_number.living_room_brightness') }}"
+        set_level:
+          service: input_number.set_value
+          data:
+            entity_id: input_number.living_room_brightness
+            value: "{{ brightness }}"
+      kitchen:
+        friendly_name: "Kitchen Light"
+        unique_id: lava_light_kitchen
+        value_template: "{{ states('input_boolean.kitchen_power') }}"
+        turn_on:
+          service: input_boolean.turn_on
+          data:
+            entity_id: input_boolean.kitchen_power
+        turn_off:
+          service: input_boolean.turn_off
+          data:
+            entity_id: input_boolean.kitchen_power
+        level_template: "{{ states('input_number.kitchen_brightness') }}"
+        set_level:
+          service: input_number.set_value
+          data:
+            entity_id: input_number.kitchen_brightness
+            value: "{{ brightness }}"
+
+# --- virtual thermostat -----------------------------------------------------
+# generic_thermostat needs a `sensor` (current temp) and a `heater` (a switch
+# it toggles). The sensor is an editable input_number, the heater is a
+# cosmetic template switch - so the whole thing is virtual and dashboard-editable.
+climate:
+  - platform: generic_thermostat
+    name: Living Room Thermostat
+    unique_id: lava_virtual_thermostat
+    heater: switch.lava_heater
+    target_sensor: input_number.thermostat_current
+    target_temp: 21
+    min_temp: 5
+    max_temp: 35
+    ac_mode: false
+    initial_hvac_mode: heat
+
+switch:
+  - platform: template
+    switches:
+      lava_heater:
+        friendly_name: "Virtual Heater"
+        unique_id: lava_virtual_heater
+        value_template: "{{ states('input_boolean.lava_heater') }}"
+        turn_on:
+          service: input_boolean.turn_on
+          data:
+            entity_id: input_boolean.lava_heater
+        turn_off:
+          service: input_boolean.turn_off
+          data:
+            entity_id: input_boolean.lava_heater
+
+# --- backing inputs (editable from the dashboard) ----------------------------
+input_boolean:
+  living_room_power:
+    name: Living Room Power
+    initial: off
+  kitchen_power:
+    name: Kitchen Power
+    initial: off
+  lava_heater:
+    name: Virtual Heater Power
+    initial: off
+
+input_number:
+  living_room_brightness:
+    name: Living Room Brightness
+    min: 1
+    max: 255
+    step: 1
+    initial: 255
+  kitchen_brightness:
+    name: Kitchen Brightness
+    min: 1
+    max: 255
+    step: 1
+    initial: 255
+  thermostat_target:
+    name: Thermostat Target
+    min: 5
+    max: 35
+    step: 0.5
+    initial: 21
+  thermostat_current:
+    name: Thermostat Current
+    min: 10
+    max: 40
+    step: 0.1
+    initial: 23

@@ -19,6 +19,7 @@ from web.core.config import (
 from web.core.llm import ASR_CORRECT_GRACE, _correct_asr, llm_stream
 from web.core.mcp_client import asr_conn
 from web.core.music import MUSIC_NOTE, maybe_music_command, run_music_command
+from web.core.notifications import tool_frame
 from web.core.speech import TEXT_FLUSH_SECS, Speaker, send, speak_text, split_sentences
 from web.core.spelling import handle_spelling
 from web.core.state import STATE, _fd_record, _trim_history, done_stats
@@ -61,19 +62,20 @@ async def run_turn(
                 text_out.clear()
                 last_text_flush = time.perf_counter()
 
-        async for kind, payload in llm_stream(history):
+        async def _notify(phase: str, name: str, args: dict, result: str | None):
+            """Push a command-notification frame to the UI as tools run.
+            `phase` is "start" (optimistic) or "done" (final, with result).
+            The server computes the display strings; the client only renders
+            and collapses repeats by key."""
+            await send(ws, tool_frame(phase, name, args, result))
+
+        async for kind, payload in llm_stream(history, notify=_notify):
             if time.monotonic() > deadline:
                 raise TimeoutError("turn deadline exceeded")
             if kind == "tool_call":
+                # The tool is about to run: the optimistic toast already went
+                # out via _notify("start"); nothing more to send here.
                 await flush_text()
-                await send(
-                    ws,
-                    {
-                        "type": "tool",
-                        "name": payload["name"],
-                        "args": json.dumps(payload["arguments"])[:120],
-                    },
-                )
                 continue
             buf += payload
             text_out.append(payload)

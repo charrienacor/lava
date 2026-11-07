@@ -10,6 +10,7 @@ from loguru import logger
 
 from web.core.config import FAST_MUSIC_COMMANDS, MUSIC_MODE_GRACE
 from web.core.mcp_client import exec_tool
+from web.core.notifications import tool_frame
 from web.core.speech import send, speak_text
 from web.core.state import STATE, _trim_history, done_stats
 
@@ -377,10 +378,15 @@ async def run_music_command(
     """Execute a matched music command directly (no LLM) and ack by voice."""
     tool, args = cmd["tool"], cmd["args"]
     logger.info(f"[web] music fast path {tool}({json.dumps(args)}) <- {text!r}")
-    await send(ws, {"type": "tool", "name": tool, "args": json.dumps(args)[:120]})
+
+    async def _notify(phase: str, name: str, a: dict, result: str | None):
+        # Same command-notification frames as the LLM tool loop: an
+        # optimistic toast while the tool runs, flipped in place on done.
+        await send(ws, tool_frame(phase, name, a, result))
+
     history = sess["history"]
     history.append({"role": "user", "content": text})
-    result = await exec_tool(tool, args)
+    result = await exec_tool(tool, args, notify=_notify)
     try:
         res = json.loads(result)
     except ValueError:

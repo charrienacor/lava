@@ -137,11 +137,12 @@ async def _open_stream(start: int, msgs: list[dict]):
     raise last_err
 
 
-async def llm_stream(messages: list[dict]):
+async def llm_stream(messages: list[dict], notify=None):
     """Yield ('text', str) and ('tool_call', dict) tuples.
 
     Runs the tool loop: execute any tool calls, feed results back, keep
-    streaming until prose."""
+    streaming until prose. `notify` (optional) is forwarded to exec_tool so
+    the bridge can push command notifications to the UI as tools run."""
     msgs = [dict(m) for m in messages]
     model_idx = 0
     while True:
@@ -193,7 +194,7 @@ async def llm_stream(messages: list[dict]):
                 }
             )
             results = await asyncio.gather(
-                *(exec_tool(e["name"], args) for e, args in calls)
+                *(exec_tool(e["name"], args, notify=notify) for e, args in calls)
             )
             for (e, _), result in zip(calls, results):
                 msgs.append(

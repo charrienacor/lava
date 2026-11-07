@@ -12,7 +12,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 
-ROOT = Path(__file__).resolve().parent.parent
+# Project root (lava/). config.py lives at lava/web/core/, so three parents up.
+# (Two parents lands on lava/web/, which has no .env - the load silently no-ops
+# and the bridge then depends on the shell having the key exported. That broke
+# any cold start, e.g. the fd-benchmark assistant, which spawns a clean process.)
+ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / ".env")
 
 
@@ -96,7 +100,10 @@ SYSTEM_PROMPT = (
     "two short, natural sentences. Never use markdown, bullet points, emojis, or stage "
     "directions - only words that sound good out loud. Use the available tools whenever they "
     "can answer the question (time, weather, search, wikipedia, timers and reminders, saved "
-    "notes, music playback on Spotify, system status); reminders and notes are the same store - the notes "
+    "notes, music playback on Spotify, smart-home lights and thermostat via Home Assistant "
+"(set the temperature OR read the current one - get_temperature answers "
+"'what's the temperature?' questions), "
+    "calls and messages on Telegram (call_contact sends the person a call-back request - bots cannot initiate calls - and send_message delivers a text; both need TELEGRAM_BOT_TOKEN in .env, and people become reachable once they have messaged the bot; if the tool reports Telegram is not configured, relay that honestly), system status); reminders and notes are the same store - the notes "
     "tools. Tool results are ground truth for dynamic facts, so quote them exactly. If the "
     "user doubts an answer, call the tool again and stand by what it returns - never invent "
     "a different or empty result just to agree with them. If a tool returns nothing, say so "

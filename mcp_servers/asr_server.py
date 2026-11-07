@@ -57,7 +57,11 @@ class GroqWhisper:
         self._client = httpx.AsyncClient(
             base_url="https://api.groq.com/openai/v1",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            timeout=httpx.Timeout(8.0, connect=5.0),
+            # Read timeout: observed Groq latencies run 0.6-3.3 s, with
+            # free-tier spikes past 8 s (the old ceiling) that surfaced as
+            # blank "transcribe failed:" errors. 12 s rescues the borderline
+            # clips; the 45 s turn deadline still bounds the worst case.
+            timeout=httpx.Timeout(12.0, connect=5.0),
         )
         self.model = GROQ_ASR_MODEL
 
@@ -129,10 +133,17 @@ async def transcribe(
         engine = await get_engine(backend or ASR_BACKEND)
         text, quality = await engine.transcribe(wav, language)
     except Exception as e:
-        logger.error(f"transcribe failed: {e}")
+        # httpx timeout exceptions stringify to '' - name them explicitly so
+        # the log line (and the apology trigger) says WHY it failed.
+        detail = str(e) or type(e).__name__
+        if isinstance(e, httpx.TimeoutException):
+            detail = f"{type(e).__name__} (Groq request timed out)"
+        elif isinstance(e, httpx.HTTPStatusError):
+            detail = f"HTTP {e.response.status_code} from Groq"
+        logger.error(f"transcribe failed: {detail}")
         return {
             "text": "",
-            "error": f"transcribe failed: {str(e)[:200]}",
+            "error": f"transcribe failed: {detail[:200]}",
             "audio_secs": 0.0,
             "server_ms": round(now_ms() - t0, 1),
         }

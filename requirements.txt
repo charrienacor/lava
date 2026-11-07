@@ -9,3 +9,4 @@ numpy>=1.26
 loudness>=0.2
 piper-tts>=1.8
 ddgs>=9.0
+python-telegram-bot

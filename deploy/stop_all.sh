@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# stop_all.sh — stop the Lava MCP servers (asr, tts, tools).
+# stop_all.sh — stop the Lava MCP servers (asr, tts, tools) and the
+# virtual Home Assistant hub (ha/, :8123).
 #
 # The web bridge (web/server.py, :8080) is not managed here — stop it
 # yourself (Ctrl-C in its terminal, or:  pkill -f "web\.server").
@@ -44,7 +45,7 @@ echo "Stopping Lava MCP servers…"
 
 # --- 1) PID files from start_all.sh ----------------------------------------
 
-for name in tools tts asr; do
+for name in tools tts asr ha; do
     pidfile="$LOGS/$name.pid"
     if [ -f "$pidfile" ]; then
         kill_pid "$(cat "$pidfile")" "$name"
@@ -53,7 +54,7 @@ done
 
 # --- 2) Fallback: anything started by hand ----------------------------------
 
-for mod in "mcp_servers\.tools_server" "mcp_servers\.tts_server" "mcp_servers\.asr_server"; do
+for mod in "mcp_servers\.tools_server" "mcp_servers\.tts_server" "mcp_servers\.asr_server" "homeassistant"; do
     for pid in $(pgrep -f "$mod" 2>/dev/null); do
         # Skip our own shell if the pattern happens to match it.
         [ "$pid" = "$$" ] && continue
@@ -79,7 +80,7 @@ PYEOF
 
 sleep 1
 clean=1
-for p in 8003 8002 8001; do
+for p in 8003 8002 8001 8123; do
     if port_listening "$p"; then
         echo "  ✗ :$p still has a listener — find it with:  lsof -nP -iTCP:$p -sTCP:LISTEN"
         clean=0
@@ -90,7 +91,7 @@ done
 
 echo
 if [ "$clean" -eq 1 ]; then
-    echo "MCP servers stopped. Logs preserved in logs/."
+    echo "Stopped (MCP servers + Home Assistant). Logs preserved in logs/."
 else
     echo "Something is still holding a port — see above." >&2
     exit 1

@@ -17,3 +17,14 @@ logs/*
 
 # Models
 models/
+
+# fd-benchmark tool (cloned, has its own venv and results)
+fd-benchmark/
+
+# Home Assistant (virtual hub) - venv + generated state, not the config
+ha/venv/
+ha/data/
+ha/config/
+
+# fd-benchmark
+fd-benchmark/

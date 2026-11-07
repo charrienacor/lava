@@ -9,6 +9,16 @@ Every tool here uses free services or the Pi itself, with no API keys:
   set_timer etc.  countdown timers; the agent announces them when they finish
   notes           add / list / delete / clear a persistent to-do / notes list
   system_status   Pi CPU temperature, load, memory, uptime, IP
+  set_lights      lights on/off + brightness + colour via Home Assistant
+  set_thermostat  thermostat target temperature via Home Assistant
+  get_temperature current room temperature (+ target) via Home Assistant
+                  (all three need HASS_URL + HASS_TOKEN in .env)
+  call_contact    reach a contact on Telegram with a call-back request
+                  (bots can't initiate calls; the contact gets a Telegram
+                  message asking them to call back)
+  send_message    send a Telegram message (recipients are learned from
+                  incoming bot messages; unknown ones go to the owner's
+                  chat - needs TELEGRAM_BOT_TOKEN in .env)
   music_*         Spotify search / play / pause / skip / queue / volume /
                   shuffle / repeat / now-playing / devices
                   (needs SPOTIFY_CLIENT_ID/SECRET in .env; playback needs the
@@ -22,6 +32,7 @@ import json
 import os
 import re
 import socket
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -73,7 +84,9 @@ _wx_cache: dict[tuple[float, float], tuple[float, dict]] = {}
 
 @asynccontextmanager
 async def _lifespan(_server):
+    _tg_start_poller()  # learn Telegram contacts from incoming messages
     yield {}
+    _tg_stop_poller()
     if _http is not None and not _http.is_closed:
         await _http.aclose()
     await spotify.close()  # release the pooled Spotify client too
@@ -196,9 +209,47 @@ async def get_weather(location: str = DEFAULT_CITY) -> dict:
 # search / knowledge
 
 
+def _plain_text(value: str) -> str:
+    """Strip markdown emphasis and stray HTML tags from search snippets.
+
+    DuckDuckGo snippets routinely carry **bold** / *italic* markers and the
+    occasional leftover HTML tag. Left in the tool output, the LLM echoes
+    them into spoken replies. Clean at the source so the model never sees
+    them.
+    """
+    if not value:
+        return ""
+    text = value
+    # markdown bold: **text** / __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    # markdown italic: *text* / _text_ (guarded so snake_case survives)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"\1", text)
+    # leftover HTML tags, e.g. <b>, </span>
+    text = re.sub(r"</?[a-zA-Z][^>]*>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Engines raced in parallel for web_search. No single engine is reliable:
+# DuckDuckGo (the primary) intermittently times out or serves a bot-check page
+# (HTTP 202) that parses to zero results, so we fan out and take the first
+# engine that actually returns hits. These are the valid ddgs 9.x text
+# backends - "bing" is NOT one of them (it silently falls back to "auto",
+# which fans out to every engine including the encyclopedias).
+_SEARCH_BACKENDS = ("duckduckgo", "brave", "mojeek", "startpage", "yahoo")
+# Per-engine cap. Kept under the web bridge's 12 s tool timeout (with margin
+# for MCP transport) so a hung engine can't blow the whole turn's budget.
+_SEARCH_DEADLINE = 8.0
+
+
 @mcp.tool()
 async def web_search(query: str, max_results: int = 4) -> dict:
     """Search the web for current information (news, prices, facts, events).
+
+    Races several search engines in parallel and returns the first that
+    produces results, so one slow or challenged engine no longer kills the
+    lookup.
 
     Args:
         query: What to search for.
@@ -211,28 +262,48 @@ async def web_search(query: str, max_results: int = 4) -> dict:
     if not query:
         return {"error": "Give me something to search for."}
 
-    def _search():
-        return DDGS().text(query, max_results=max_results)
+    def _search_one(backend: str) -> list:
+        # timeout=4: ddgs's 5 s default would eat the whole shared budget on
+        # the first engine alone, leaving the fallbacks no time to answer.
+        return DDGS(timeout=4).text(query, max_results=max_results, backend=backend)
 
-    try:
-        hits = await asyncio.to_thread(_search)
-    except Exception as e:
-        # ddgs raises "No results found." when the engine simply has no hits -
-        # that is an empty answer, not a failure.
-        if "no results" in str(e).lower():
+    # Sequential with a shared deadline: firing every engine at once hammers
+    # them all (and ourselves) in parallel - the burst itself trips their
+    # rate limiters, which is exactly the failure we are trying to dodge.
+    # Try the primary first; only fall through when it yields nothing, and
+    # stop as soon as the clock runs out.
+    deadline = time.monotonic() + _SEARCH_DEADLINE
+    for backend in _SEARCH_BACKENDS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            break
+        try:
+            hits = await asyncio.wait_for(
+                asyncio.to_thread(_search_one, backend),
+                timeout=remaining,
+            )
+        except Exception:
+            # Timeout, "No results found.", a bot-check page, or a transport
+            # error - all mean "nothing from this engine", so try the next.
+            continue
+        if hits:
             return {
                 "query": query,
-                "results": [],
-                "note": f"No web results for {query!r} - try different wording",
+                "engine": backend,
+                "results": [
+                    {
+                        "title": _plain_text(h.get("title") or ""),
+                        "snippet": _plain_text(h.get("body") or ""),
+                        "url": h.get("href"),
+                    }
+                    for h in hits
+                    if h
+                ],
             }
-        return {"error": f"search failed: {str(e)[:200]}"}
     return {
         "query": query,
-        "results": [
-            {"title": h.get("title"), "snippet": h.get("body"), "url": h.get("href")}
-            for h in hits
-            if h
-        ],
+        "results": [],
+        "note": f"No web results for {query!r} - try different wording",
     }
 
 
@@ -243,40 +314,73 @@ async def wikipedia(topic: str) -> dict:
     Args:
         topic: The subject, e.g. "Jose Rizal" or "Raspberry Pi".
     """
-    try:
-        http = get_http()
-        search = await http.get(
-            "https://en.wikipedia.org/w/api.php",
-            params={
-                "action": "opensearch",
-                "search": topic,
-                "limit": 1,
-                "format": "json",
-            },
-        )
-        search.raise_for_status()
+    from urllib.parse import quote
+
+    # Wikimedia's robot policy wants a descriptive UA with contact info; a bare
+    # product string gets intermittently 403-throttled. This one complies.
+    wiki_headers = {
+        "User-Agent": "LavaVoiceAgent/1.0 (personal voice assistant; contact: charrieannenacor@gmail.com)"
+    }
+    topic = (topic or "").strip()
+    if not topic:
+        return {"error": "Give me a topic to look up."}
+
+    http = get_http()
+    search_json = None
+    # Bursty throttling: a 403/429 here is usually transient, so retry with a
+    # short backoff before giving up (two attempts total, ~1.5 s worst case).
+    for attempt in range(2):
         try:
+            search = await http.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "opensearch",
+                    "search": topic,
+                    "limit": 1,
+                    "format": "json",
+                },
+                headers=wiki_headers,
+            )
+            if search.status_code in (403, 429):
+                raise httpx.HTTPStatusError(
+                    f"throttled ({search.status_code})",
+                    request=search.request,
+                    response=search,
+                )
+            search.raise_for_status()
             search_json = search.json()
-        except ValueError:
-            return {
-                "error": f"Wikipedia returned a non-JSON response (status {search.status_code}); try again later"
-            }
-        if not search_json[1]:
-            return {"error": f"No Wikipedia article found for {topic}"}
-        title = search_json[1][0]
+            break
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+            if attempt == 0:
+                await asyncio.sleep(1.5)
+                continue
+            return {"error": f"Wikipedia lookup failed: {str(e)[:160]}"}
+    if search_json is None:
+        return {"error": "Wikipedia lookup failed: no response"}
+
+    if not search_json[1]:
+        return {"error": f"No Wikipedia article found for {topic}"}
+    title = search_json[1][0]
+    # Quote the title: REST paths break on spaces/slashes/special chars.
+    page_path = quote(title.replace(" ", "_"))
+    try:
         page_resp = await http.get(
-            f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}"
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{page_path}",
+            headers=wiki_headers,
         )
         page_resp.raise_for_status()
-        try:
-            page = page_resp.json()
-        except ValueError:
-            return {
-                "error": f"Wikipedia summary lookup failed (status {page_resp.status_code}); try again later"
-            }
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        return {"error": f"Wikipedia lookup failed: {e}"}
-    return {"title": page.get("title", title), "summary": page.get("extract", "")}
+        page = page_resp.json()
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        # The opensearch description is a decent fallback if the summary dies.
+        desc = (search_json[2] or [""])[0].strip()
+        if desc:
+            return {"title": title, "summary": _plain_text(desc)}
+        return {"error": f"Wikipedia summary lookup failed: {str(e)[:160]}"}
+    summary = (page.get("extract") or "").strip()
+    if not summary:
+        desc = (search_json[2] or [""])[0].strip()
+        summary = desc or "Wikipedia has an article for this but no short summary."
+    return {"title": page.get("title", title), "summary": _plain_text(summary)}
 
 
 # timers
@@ -427,6 +531,657 @@ def clear_notes() -> dict:
     n = len(_load_notes())
     _save_notes([])
     return {"deleted": n}
+
+
+# smart home (Home Assistant: lights + thermostat)
+#
+# One self-hosted hub covers three command families (lights on/off, dim /
+# colour, thermostat). Point HASS_URL at any Home Assistant instance (it can
+# be the same Raspberry Pi) and mint a long-lived access token under
+# Profile -> Security. With no HASS_URL/HASS_TOKEN in .env every tool below
+# returns an honest "not connected" error instead of pretending.
+
+HASS_URL = (os.getenv("HASS_URL") or "").strip().rstrip("/")
+HASS_TOKEN = (os.getenv("HASS_TOKEN") or "").strip()
+HASS_LIGHT_ENTITY = (os.getenv("HASS_LIGHT_ENTITY") or "light.living_room").strip()
+HASS_CLIMATE_ENTITY = (os.getenv("HASS_CLIMATE_ENTITY") or "").strip()
+
+# /api/states is a full-home dump (~tens of KB); entity discovery caches it
+# for a short window so "dim the living room" + "turn it off" back to back
+# costs one poll, not two.
+STATES_CACHE_TTL = 15.0
+_states_cache: tuple[float, list] | None = None
+
+# Spoken white tones land on kelvin; named colours pass through to Home
+# Assistant, which accepts any CSS colour name.
+_KELVIN_BY_TONE = {
+    "warm": 2700,
+    "warm white": 2700,
+    "soft white": 2700,
+    "cool": 5000,
+    "cool white": 5000,
+    "daylight": 5600,
+    "white": 4000,
+}
+
+
+def _hass_unconfigured() -> dict | None:
+    if not HASS_URL or not HASS_TOKEN:
+        return {
+            "error": "No smart home hub connected - add HASS_URL and "
+            "HASS_TOKEN to .env (Home Assistant long-lived access token) "
+            "to enable lights and thermostat."
+        }
+    return None
+
+
+async def _hass(method: str, path: str, **kw) -> tuple[int, object]:
+    """Call the Home Assistant REST API; returns (status, parsed body)."""
+    http = get_http()
+    r = await http.request(
+        method,
+        f"{HASS_URL}{path}",
+        headers={"Authorization": f"Bearer {HASS_TOKEN}"},
+        **kw,
+    )
+    try:
+        body = r.json()
+    except ValueError:
+        body = None
+    return r.status_code, body
+
+
+def _hass_status_error(status: int) -> dict | None:
+    if status == 401:
+        return {"error": "Home Assistant rejected the access token - check HASS_TOKEN."}
+    if status == 404:
+        return {"error": f"Home Assistant at {HASS_URL} did not find that endpoint - check HASS_URL."}
+    if status >= 400:
+        return {"error": f"Home Assistant said: {status}"}
+    return None
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+async def _hass_entities(prefix: str, room: str) -> tuple[list[dict], str | None]:
+    """Match entities of one domain (e.g. "light") against a room name.
+
+    Returns (matches, error). A match needs the room word inside the entity
+    id or its friendly name; an empty room matches everything in the domain.
+    """
+    global _states_cache
+    now = time.monotonic()
+    if _states_cache is None or now - _states_cache[0] > STATES_CACHE_TTL:
+        status, states = await _hass("GET", "/api/states")
+        if not isinstance(states, list):
+            err = _hass_status_error(status) or {
+                "error": f"Could not read Home Assistant's entity list (status {status})."
+            }
+            return [], err
+        _states_cache = (now, states)
+    want = _norm(room)
+    matches = []
+    for s in _states_cache[1]:
+        eid = s.get("entity_id", "")
+        if not eid.startswith(f"{prefix}."):
+            continue
+        friendly = (s.get("attributes") or {}).get("friendly_name", "")
+        if not want or want in _norm(eid.split(".", 1)[1]) or want in _norm(friendly):
+            matches.append({"entity_id": eid, "name": friendly or eid})
+    return matches, None
+
+
+@mcp.tool()
+async def set_lights(
+    room: str = "living room",
+    on: bool = True,
+    brightness_pct: int = 0,
+    color: str = "",
+) -> dict:
+    """Turn lights on or off, optionally setting brightness and colour.
+
+    Needs a Home Assistant hub (HASS_URL + HASS_TOKEN in .env).
+
+    Args:
+        room: Room or light name, e.g. "living room" or "desk lamp".
+        on: True to turn the lights on, False to turn them off.
+        brightness_pct: Brightness 1-100; 0 leaves it unchanged.
+        color: Optional colour or white tone: "warm", "cool", "red", "blue", ...
+    """
+    unconfigured = _hass_unconfigured()
+    if unconfigured:
+        return unconfigured
+    room = (room or "").strip() or "living room"
+    if brightness_pct:
+        brightness_pct = max(1, min(100, int(brightness_pct)))
+    color = (color or "").strip().lower()
+    matches, err = await _hass_entities("light", room)
+    if err:
+        return err
+    if not matches:
+        # No name hit: fall back to the configured default entity so "the
+        # lights" still works when only one room is automated.
+        if HASS_LIGHT_ENTITY:
+            matches = [{"entity_id": HASS_LIGHT_ENTITY, "name": room}]
+        else:
+            return {"error": f"No lights matching {room!r} in Home Assistant."}
+    ids = [m["entity_id"] for m in matches]
+    label = " + ".join(dict.fromkeys(m["name"].title() for m in matches))
+    service = "turn_off" if not on else "turn_on"
+    data: dict = {"entity_id": ids}
+    if on:
+        if brightness_pct:
+            data["brightness_pct"] = brightness_pct
+        if color:
+            kelvin = _KELVIN_BY_TONE.get(color)
+            if kelvin:
+                data["color_temp_kelvin"] = kelvin
+            else:
+                data["color_name"] = color
+    status, _ = await _hass("POST", f"/api/services/light/{service}", json=data)
+    err = _hass_status_error(status)
+    if err:
+        return err
+    out: dict = {"lights": label, "on": on}
+    if on and brightness_pct:
+        out["brightness_pct"] = brightness_pct
+    if on and color:
+        out["color"] = color
+    return out
+
+
+@mcp.tool()
+async def set_thermostat(temperature: float, room: str = "", unit: str = "C") -> dict:
+    """Set the thermostat's target temperature.
+
+    Needs a Home Assistant hub (HASS_URL + HASS_TOKEN in .env).
+
+    Args:
+        temperature: Target temperature, e.g. 22.
+        room: Optional room / thermostat name; empty uses the only one.
+        unit: "C" or "F" - the number is sent as given.
+    """
+    unconfigured = _hass_unconfigured()
+    if unconfigured:
+        return unconfigured
+    try:
+        temperature = float(temperature)
+    except (TypeError, ValueError):
+        return {"error": f"{temperature!r} is not a temperature."}
+    if temperature.is_integer():
+        temperature = int(temperature)  # 22.0 -> 22: "set to 22 °C", not "22.0"
+    unit = (unit or "C").strip().upper()
+    if unit not in ("C", "F"):
+        unit = "C"
+    if unit == "C" and not 5 <= temperature <= 35:
+        return {"error": f"{temperature} C is outside a sane thermostat range (5-35)."}
+    if unit == "F" and not 41 <= temperature <= 95:
+        return {"error": f"{temperature} F is outside a sane thermostat range (41-95)."}
+    matches, err = await _hass_entities("climate", room)
+    if err:
+        return err
+    if not matches:
+        if HASS_CLIMATE_ENTITY:
+            matches = [{"entity_id": HASS_CLIMATE_ENTITY, "name": room or "Thermostat"}]
+        else:
+            return {"error": f"No thermostat matching {room or 'this home'!r} in Home Assistant."}
+    if len(matches) > 1 and room:
+        matches = matches[:1]  # a spoken room name targets one thermostat
+    ids = [m["entity_id"] for m in matches]
+    label = matches[0]["name"].title() if matches[0]["name"] else "Thermostat"
+    status, _ = await _hass(
+        "POST",
+        "/api/services/climate/set_temperature",
+        json={"entity_id": ids, "temperature": temperature},
+    )
+    err = _hass_status_error(status)
+    if err:
+        return err
+    return {"thermostat": label, "temperature": temperature, "unit": unit}
+
+
+@mcp.tool()
+async def get_temperature(room: str = "") -> dict:
+    """Read the current temperature from the thermostat.
+
+    Reports the temperature the room is AT right now (and the target, if the
+    thermostat exposes one). Use this for "what's the temperature?", "how
+    hot is it in here?" - set_thermostat only changes the target.
+
+    Needs a Home Assistant hub (HASS_URL + HASS_TOKEN in .env).
+
+    Args:
+        room: Optional room / thermostat name; empty uses the only one.
+    """
+    unconfigured = _hass_unconfigured()
+    if unconfigured:
+        return unconfigured
+    matches, err = await _hass_entities("climate", room)
+    if err:
+        return err
+    if not matches:
+        if HASS_CLIMATE_ENTITY:
+            matches = [{"entity_id": HASS_CLIMATE_ENTITY, "name": room or "Thermostat"}]
+        else:
+            return {"error": f"No thermostat matching {room or 'this home'!r} in Home Assistant."}
+    if len(matches) > 1 and room:
+        matches = matches[:1]  # a spoken room name targets one thermostat
+
+    # Re-read just the matched entities (fresh, not from the 15 s discovery
+    # cache - a temperature read should reflect the hub right now).
+    status, states = await _hass("GET", "/api/states")
+    if not isinstance(states, list):
+        return _hass_status_error(status) or {
+            "error": f"Could not read Home Assistant's entity list (status {status})."
+        }
+    by_id = {s.get("entity_id"): s for s in states if isinstance(s, dict)}
+
+    # climate.state is the HVAC MODE ("heating", "off", ...) - the numbers are
+    # in attributes: current_temperature = room temp now, temperature = target.
+    temps, units, targets, modes, names = [], [], [], [], []
+    for m in matches:
+        st = by_id.get(m["entity_id"])
+        if not st:
+            continue
+        attrs = st.get("attributes") or {}
+        unit = attrs.get("temperature_unit", "°C")
+        cur = attrs.get("current_temperature")
+        tgt = attrs.get("temperature")
+        if isinstance(cur, (int, float)):
+            temps.append(float(cur))
+            units.append(unit)
+        if isinstance(tgt, (int, float)):
+            targets.append(float(tgt))
+        if isinstance(st.get("state"), str):
+            modes.append(st["state"])
+        names.append(m["name"] or m["entity_id"].split(".", 1)[1].replace("_", " "))
+    if not temps:
+        return {
+            "error": f"{names[0] if names else 'The thermostat'} reports no temperature reading."
+        }
+
+    def _fmt(v: float) -> int | float:
+        return int(v) if float(v).is_integer() else round(v, 1)
+
+    out: dict = {
+        "thermostat": names[0],
+        "current": _fmt(sum(temps) / len(temps)),
+        "unit": units[0],
+    }
+    if len(names) > 1:
+        out["rooms"] = {n: _fmt(t) for n, t in zip(names, temps)}
+    if targets:
+        out["target"] = _fmt(targets[0])
+    if modes:
+        out["mode"] = modes[0]
+    return out
+
+
+# calls / messages - Telegram machinery (registry, poller, tools) lives
+# below, after _resolve_contact.
+
+_EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
+_PHONE_RE = re.compile(r"^\+?[\d\s()\-]{3,}$")
+
+
+async def _resolve_contact(contact: str) -> dict:
+    """Turn a name / number / address into {"display", "dial"} or {"error"}."""
+    c = (contact or "").strip()
+    if not c:
+        return {"error": "Who should I call?"}
+    if _EMAIL_RE.match(c):
+        return {"display": c, "dial": c}
+    if _PHONE_RE.match(c) and any(ch.isdigit() for ch in c):
+        return {"display": c, "dial": re.sub(r"[^\d+]", "", c)}
+    if sys.platform != "darwin":
+        return {
+            "error": f"I can only call from a Mac - {c!r} needs a number "
+            "or an email address here."
+        }
+    # A name: ask Contacts.app for the first phone number (macOS prompts
+    # for Contacts access on the first call).
+    script = (
+        'tell application "Contacts" to get value of phone 1 of '
+        f'(first person whose name contains "{c.replace(chr(34), "")}")'
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, stderr = await asyncio.wait_for(proc.communicate(), 8)
+    except Exception as e:
+        return {"error": f"Contacts lookup failed: {e}"}
+    if proc.returncode != 0:
+        why = (stderr or b"").decode(errors="replace").strip()
+        return {
+            "error": f"I could not find a number for {c!r} in Contacts"
+            + (f" ({why.splitlines()[0][:80]})" if why else "")
+            + " - give me a phone number or email address."
+        }
+    digits = re.sub(r"[^\d+]", "", out.decode(errors="replace").strip())
+    if not digits:
+        return {"error": f"{c!r} has no phone number in Contacts."}
+    return {"display": c, "dial": digits}
+
+
+# --- Telegram ---------------------------------------------------------------
+# Calls and messages both go out through the Telegram Bot API. Two platform
+# limits shape the design (both verified against the Bot API docs):
+#
+#   1. Bots cannot initiate calls - calls are peer-to-peer and the Bot API
+#      has no call method. "Call X" therefore sends X a call-BACK request.
+#   2. A bot can only message a chat that has messaged IT first (or a group
+#      it was added to). There is no phone-number -> chat_id lookup, so the
+#      bot learns its contacts from incoming messages: a background
+#      getUpdates poller records each sender (name, username, phone if
+#      present) in a local registry, and the tools resolve names against
+#      that registry first, then Contacts.app.
+#
+# TELEGRAM_BOT_TOKEN is required for either tool. TELEGRAM_CHAT_ID is the
+# OWNER's chat id - the default destination when a name resolves nowhere
+# else (single-user setups: everyone talks to the bot in the owner's chat).
+# Without the token the tools return an honest "not configured" error.
+
+TG_REGISTRY_FILE = ROOT / "logs" / "telegram_contacts.json"
+TG_POLL_INTERVAL = 2.0  # seconds between getUpdates polls
+TG_LONG_POLL = 25  # server-side long-poll seconds (max 50)
+
+_tg_registry: dict[str, dict] = {}  # key -> {name, username, phone, chat_id}
+_tg_poll_task: asyncio.Task | None = None
+
+
+def _tg_config() -> dict | None:
+    """Return {"token", "owner_chat_id"} from the environment, or None."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return None
+    return {
+        "token": token,
+        "owner_chat_id": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+    }
+
+
+def _tg_result(resp: httpx.Response) -> tuple[bool, dict]:
+    """Parse a Bot API response into (ok, payload).
+
+    Telegram returns 200 with {"ok": false, ...} for logical failures, so
+    the status code alone is not enough - both are checked.
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return False, {"description": f"HTTP {resp.status_code}"}
+    if resp.status_code >= 400 or not payload.get("ok", False):
+        desc = payload.get("description") or f"HTTP {resp.status_code}"
+        return False, {"description": str(desc)[:200]}
+    return True, payload
+
+
+def _tg_load_registry() -> None:
+    """Load the contact registry from disk (corrupt file -> empty)."""
+    global _tg_registry
+    try:
+        data = json.loads(TG_REGISTRY_FILE.read_text())
+        if isinstance(data, dict):
+            _tg_registry = data
+    except (OSError, ValueError):
+        _tg_registry = {}
+
+
+def _tg_save_registry() -> None:
+    try:
+        TG_REGISTRY_FILE.write_text(json.dumps(_tg_registry, indent=2))
+    except OSError as e:
+        logger.warning("[tools] could not save Telegram registry: {}", e)
+
+
+def _tg_register(chat: dict) -> None:
+    """Record an incoming-message sender so later commands can reach them."""
+    first = (chat.get("first_name") or "").strip()
+    last = (chat.get("last_name") or "").strip()
+    name = " ".join(x for x in (first, last) if x)
+    phone = (chat.get("phone_number") or "").strip()
+    key = str(chat.get("id"))
+    entry = _tg_registry.get(key, {})
+    if name:
+        entry["name"] = name
+    if chat.get("username"):
+        entry["username"] = str(chat["username"])
+    if phone:
+        entry["phone"] = phone
+    entry["chat_id"] = key
+    _tg_registry[key] = entry
+    _tg_save_registry()
+
+
+async def _tg_poll_updates() -> None:
+    """Background loop: consume getUpdates and register each sender.
+
+    Runs for the life of the tools server when a bot token is configured.
+    A dead network or a revoked token must never kill the server, so every
+    failure just waits and retries.
+    """
+    cfg = _tg_config()
+    if cfg is None:
+        return
+    _tg_load_registry()
+    offset = 0
+    http = get_http()
+    while True:
+        try:
+            resp = await http.post(
+                f"https://api.telegram.org/bot{cfg['token']}/getUpdates",
+                data={
+                    "offset": offset,
+                    "timeout": TG_LONG_POLL,
+                    "allowed_updates": json.dumps(["message"]),
+                },
+                timeout=TG_LONG_POLL + 10,
+            )
+            ok, payload = _tg_result(resp)
+            if not ok:
+                # 409 = another instance is polling (double start); 401 =
+                # bad token. Both are config problems, not code bugs.
+                logger.warning(
+                    "[tools] Telegram getUpdates failed: {}",
+                    payload.get("description"),
+                )
+                await asyncio.sleep(10)
+                continue
+            for upd in payload.get("result", []):
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                msg = upd.get("message") or {}
+                chat = msg.get("chat")
+                if chat:
+                    _tg_register(chat)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("[tools] Telegram poll hiccup: {}", e)
+            await asyncio.sleep(TG_POLL_INTERVAL)
+
+
+def _tg_start_poller() -> None:
+    """Start the updates poller once (idempotent)."""
+    global _tg_poll_task
+    if _tg_poll_task is None or _tg_poll_task.done():
+        _tg_poll_task = asyncio.create_task(_tg_poll_updates())
+
+
+def _tg_stop_poller() -> None:
+    global _tg_poll_task
+    if _tg_poll_task is not None and not _tg_poll_task.done():
+        _tg_poll_task.cancel()
+    _tg_poll_task = None
+
+
+def _tg_find(name: str) -> dict | None:
+    """Match a spoken name against the registry (substring, case-insens.)."""
+    n = (name or "").strip().lower()
+    if not n:
+        return None
+    for entry in _tg_registry.values():
+        hay = " ".join(
+            x for x in (entry.get("name"), entry.get("username"), entry.get("phone")) if x
+        ).lower()
+        if n in hay:
+            return entry
+    return None
+
+
+async def _tg_resolve(recipient: str) -> dict:
+    """Resolve a recipient to a Telegram destination.
+
+    Order: registry (learned from incoming messages) -> Contacts.app number
+    (only useful when the person has also messaged the bot, since the bot
+    needs a chat_id) -> the owner's own chat (TELEGRAM_CHAT_ID).
+    Returns {"chat_id", "display"} or {"error"}.
+    """
+    raw = (recipient or "").strip()
+    if not raw:
+        return {"error": "Who should I message?"}
+    cfg = _tg_config()
+    if cfg is None:
+        return {
+            "error": (
+                "Telegram isn't configured - add TELEGRAM_BOT_TOKEN to .env "
+                "(talk to @BotFather for the token). People become reachable "
+                "once they have messaged the bot at least once."
+            )
+        }
+    # 1) Learned registry entry (by name, @username, or phone digits).
+    hit = _tg_find(raw)
+    if hit is None and _PHONE_RE.match(raw) and any(ch.isdigit() for ch in raw):
+        digits = re.sub(r"[^\d+]", "", raw)
+        for entry in _tg_registry.values():
+            if entry.get("phone") and entry["phone"].lstrip("+") == digits.lstrip("+"):
+                hit = entry
+                break
+    if hit:
+        return {
+            "chat_id": hit["chat_id"],
+            "display": hit.get("name") or hit.get("username") or str(hit["chat_id"]),
+        }
+    # 2) Contacts.app: resolves a name to a NUMBER, but the bot still needs
+    #    a chat_id, so this only helps if that number is in the registry
+    #    (checked above) - otherwise fall through to the owner chat.
+    if not _PHONE_RE.match(raw) or not any(ch.isdigit() for ch in raw):
+        resolved = await _resolve_contact(raw)
+        if "error" not in resolved:
+            return {
+                "chat_id": cfg["owner_chat_id"],
+                "display": resolved["display"],
+                "note": (
+                    f"{resolved['display']} hasn't messaged the bot yet, so "
+                    "the message goes to your own Telegram chat instead."
+                ),
+            }
+    # 3) Default: the owner's chat.
+    if not cfg["owner_chat_id"]:
+        return {
+            "error": (
+                f"I don't have a Telegram chat for {raw} yet. Have them "
+                "message the bot once (so I can learn their chat), or set "
+                "TELEGRAM_CHAT_ID in .env as the default destination."
+            )
+        }
+    return {"chat_id": cfg["owner_chat_id"], "display": raw,
+            "note": f"No learned chat for {raw} - sent to your own Telegram chat."}
+
+
+@mcp.tool()
+async def call_contact(contact: str = "", service: str = "audio") -> dict:
+    """Reach a contact on Telegram with a call-back request.
+
+    Telegram bots cannot initiate calls themselves (calls are peer-to-peer
+    and the Bot API has no call method), so this sends the contact a
+    Telegram message asking them to call back - the closest a bot can get
+    to placing a call.
+
+    Args:
+        contact: Who to call: a name like "Mom" or a phone number.
+        service: "audio" for a voice call-back, "video" for a video one.
+    """
+    dest = await _tg_resolve(contact)
+    if "error" in dest:
+        return dest
+    service = "video" if (service or "").strip().lower() == "video" else "audio"
+    kind = "video" if service == "video" else "voice"
+    cfg = _tg_config()
+    text = f"Lava wants to give you a {kind} call - please call me back."
+    try:
+        resp = await get_http().post(
+            f"https://api.telegram.org/bot{cfg['token']}/sendMessage",
+            data={"chat_id": dest["chat_id"], "text": text},
+        )
+        ok, payload = _tg_result(resp)
+    except Exception as e:
+        return {"error": f"The Telegram call request failed: {e}"}
+    if not ok:
+        return {
+            "error": (
+                f"Telegram rejected the message to {dest['display']}"
+                + (f" ({payload.get('description')})" if payload.get("description") else "")
+                + "."
+            )
+        }
+    return {
+        "calling": dest["display"],
+        "via": f"Telegram {kind} call request",
+        # Speakable note: the LLM relays this almost verbatim, so keep one
+        # clause per sentence (a period, not a dash, gives a natural pause).
+        "note": (
+            f"I asked {dest['display']} to call me back on Telegram. "
+            "They will get a message from the bot."
+        ),
+    }
+
+
+@mcp.tool()
+async def send_message(recipient: str = "", message: str = "") -> dict:
+    """Send a Telegram message to a contact.
+
+    Sends the message immediately through the Telegram Bot API - it lands
+    in the recipient's Telegram app, not in iMessage. The recipient is
+    matched against the bot's learned contacts (people who have messaged
+    the bot), then Contacts.app; unknown recipients go to the owner's own
+    chat (TELEGRAM_CHAT_ID) with an honest note about it.
+
+    Args:
+        recipient: Who to message: a name like "Mom", or a phone number.
+        message: The message text to send.
+    """
+    text = " ".join((message or "").split())
+    if not text:
+        return {"error": "What should the message say?"}
+    dest = await _tg_resolve(recipient)
+    if "error" in dest:
+        return dest
+    cfg = _tg_config()
+    try:
+        resp = await get_http().post(
+            f"https://api.telegram.org/bot{cfg['token']}/sendMessage",
+            data={"chat_id": dest["chat_id"], "text": text},
+        )
+        ok, payload = _tg_result(resp)
+    except Exception as e:
+        return {"error": f"Sending the Telegram message failed: {e}"}
+    if not ok:
+        return {
+            "error": (
+                f"I could not send the message to {dest['display']!r}"
+                + (f" ({payload.get('description')})" if payload.get("description") else "")
+            )
+        }
+    note = f"Sent to {dest['display']} on Telegram."
+    if dest.get("note"):
+        note += " " + dest["note"]
+    return {"to": dest["display"], "via": "Telegram", "note": note}
+
+
 
 
 # system

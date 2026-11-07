@@ -5,6 +5,7 @@
 #   asr MCP   :8001   (Groq Whisper)
 #   tts MCP   :8002   (Piper)
 #   tools MCP :8003
+#   HA hub    :8123   (virtual Home Assistant - lights + thermostat)
 #
 # The web bridge (web/server.py, :8080) is deliberately NOT started here —
 # run it separately, after the MCP servers are up:
@@ -109,3 +110,10 @@ else
     echo "Some MCP servers did not come up — see logs/ above." >&2
     exit 1
 fi
+
+# --- virtual Home Assistant hub (:8123) ------------------------------------
+# Backs the smart-home tools (set_lights / set_thermostat / get_temperature).
+# start_ha.sh handles its own readiness wait (120 s) and token seeding, and
+# no-ops if the hub is already running.
+echo
+"$ROOT/ha/start_ha.sh"

@@ -248,8 +248,17 @@ async def load_tools():
 TOOL_TIMEOUT_SECS = float(os.getenv("TOOL_TIMEOUT_SECS", "12"))
 
 
-async def exec_tool(name: str, args: dict) -> str:
+async def exec_tool(name: str, args: dict, notify=None) -> str:
+    """Run one tools-MCP call. `notify` (optional) is an async callable
+    invoked as notify(phase, name, args, result) with phase "start" before
+    the call and "done" after it - the bridge uses it to push command
+    notifications to the UI. A broken notify never affects the tool result."""
     t0 = time.perf_counter()
+    if notify:
+        try:
+            await notify("start", name, args, None)
+        except Exception:
+            pass
     try:
         res = await asyncio.wait_for(tools_conn.call(name, args), TOOL_TIMEOUT_SECS)
         out = json.dumps(res) if not isinstance(res, str) else res
@@ -260,4 +269,9 @@ async def exec_tool(name: str, args: dict) -> str:
     logger.info(
         f"[web] tool {name}({json.dumps(args)}) -> {out[:120]} ({(time.perf_counter() - t0) * 1000:.0f} ms)"
     )
+    if notify:
+        try:
+            await notify("done", name, args, out)
+        except Exception:
+            pass
     return out

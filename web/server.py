@@ -45,7 +45,8 @@ from web.core.config import (
     WEB_HOST,
     WEB_PORT,
 )
-from web.core.mcp_client import asr_conn, load_tools, tools_conn, tts_conn
+from web.core.mcp_client import asr_conn, exec_tool, load_tools, tools_conn, tts_conn
+from web.core.notifications import describe, tool_frame
 from web.core.speech import send, send_greeting, speak_text, synth_audio
 from web.core.state import (
     CONVERSATIONS,
@@ -80,6 +81,69 @@ async def h_status(request: web.Request):
 
 async def h_index(request: web.Request):
     return web.FileResponse(Path(__file__).parent / "index.html")
+
+
+# Internal tools the bridge drives itself (poll loops) - never UI-runnable.
+_RUN_BLOCKED = {"pop_finished_timers", "music_state"}
+
+
+async def h_run(request: web.Request):
+    """Execute one tool call directly, outside a voice turn (POST /api/run).
+
+    The page's commands tray runs a row through here: the call takes the
+    exact same exec_tool -> notifications pipeline a spoken command uses,
+    so the classifier copy is the real one and the banner frames are the
+    real ones - fanned out live over the WebSocket to every ready session.
+
+    The response carries the same two frames (start/done) for tabs whose
+    session is not ready yet (they render the outage locally instead),
+    plus "broadcast" so the client knows which channel will show them."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "expected a JSON body"}, status=400)
+    name = body.get("tool")
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+    if not isinstance(name, str) or not name:
+        return web.json_response({"ok": False, "error": "missing tool name"}, status=400)
+    if name in _RUN_BLOCKED:
+        return web.json_response({"ok": False, "error": f"{name} is internal"}, status=400)
+    # Constrain to the tools the LLM itself may call (loaded from the tools
+    # MCP by the startup task). Empty set = still loading; an unknown name
+    # will then fail honestly at the tools MCP instead of here.
+    allowed = {t["function"]["name"] for t in STATE["tools"]}
+    if allowed and name not in allowed:
+        return web.json_response({"ok": False, "error": f"unknown tool {name}"}, status=400)
+
+    sent = {"n": 0}
+
+    async def _notify(phase, tname, targs, tresult):
+        frame = tool_frame(phase, tname, targs, tresult)
+        for ws in list(STATE["live_sessions"]):
+            s = STATE["by_ws"].get(ws)
+            if not s or not s.get("ready"):
+                continue
+            try:
+                await send(ws, frame)
+                sent["n"] += 1
+            except Exception:
+                pass  # one dead client must never block the others
+
+    result = await exec_tool(name, args, notify=_notify)
+    err = describe(name, args, result)["err"]
+    frames = [
+        tool_frame("start", name, args, None),
+        tool_frame("done", name, args, result),
+    ]
+    return web.json_response(
+        {
+            "ok": True,
+            "status": "error" if err else "ok",
+            "broadcast": sent["n"] > 0,
+            "frames": frames,
+            "result": result,
+        }
+    )
 
 
 def _icon_handler(filename: str):
@@ -423,7 +487,10 @@ async def announce_timers():
         # otherwise, which is the normal state for hours.
         next_timer_poll = now + (1.0 if running > 0 else 5.0)
         for t in res.get("finished", []):
-            msg = f"Heads up, your {t['label']} timer is done."
+            label = (t["label"] or "").strip() or "timer"
+            # Avoid "your timer timer" when the label already says timer.
+            tail = "" if label.lower().endswith("timer") else " timer"
+            msg = f"Heads up, your {label}{tail} is done."
             logger.info(f"[web] timer finished: {t['label']}")
             for ws in list(STATE["live_sessions"]):
                 await send(ws, {"type": "text", "t": msg})
@@ -475,6 +542,7 @@ def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", h_index)
     app.router.add_get("/api/status", h_status)
+    app.router.add_post("/api/run", h_run)
     app.router.add_get("/ws", h_ws)
     app.router.add_get("/favicon.png", _icon_handler("favicon.png"))
     app.router.add_get("/spotify/auth", h_spotify_auth)

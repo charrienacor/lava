@@ -33,7 +33,23 @@ browser mic ──▶ Silero VAD ──▶ [ASR :8001] ──▶ Groq LLM (+ [to
   "mm-hmm" backchannel or you talking to someone else, and behaves correctly
   for each (see [Overlap handling](#overlap-handling-full-duplex-bench-v15)).
 - **Real tools** — time, weather, web search, Wikipedia, timers, persistent
-  notes, Pi health checks, and full Spotify playback control.
+  notes, Pi health checks, full Spotify playback control, smart-home lights
+  and thermostat via Home Assistant, Telegram messages and call-back
+  requests (sent through the Telegram Bot API; people become reachable
+  once they have messaged the bot).
+- **Command notifications** — every tool call pops a small transient banner
+  (top-right) naming the command and its status: a spinner while it runs, a
+  check when it lands, a red error line when it fails. Ten command families
+  (music, query, lights, dim/color, timer, alarm, thermostat, media,
+  reminders, calls) get their own accent color; repeats collapse into one
+  banner, and it auto-dismisses (hover to keep it). A `commands` tray
+  (upper-right) lists every command Lava can do, grouped by purpose (know,
+  home, time, listen, system, remind, people): every row executes for real
+  through `POST /api/run` - the same pipeline a spoken command takes - and a
+  family whose hub is not linked (no Home Assistant, Spotify offline) shows
+  that hub's honest error banner. Multi-command families (e.g. the media
+  row: pause / next / volume / now-playing) cycle their example on each
+  click; shift-click previews a failure.
 - **Natural voice** — local Piper TTS streams the first clause before the
   sentence is finished, so replies start fast.
 - **Robust** — auto-reconnects to its backends, walks an LLM failover chain
@@ -102,11 +118,17 @@ then starts the three MCP servers and the web bridge. When you see
 ### Stopping and restarting
 
 - `Ctrl-C` in the `run.sh` terminal stops only the web bridge.
-- The MCP servers keep running in the background — stop them with:
+- The MCP servers (and the virtual Home Assistant hub, if you started it
+  with `./ha/start_ha.sh`) keep running in the background — stop them all
+  with:
 
 ```bash
 ./deploy/stop_all.sh
 ```
+
+`stop_all.sh` reads `logs/<name>.pid` for `tools`, `tts`, `asr` **and `ha`**,
+falls back to a `pgrep` on the module names (including a hand-started
+`homeassistant`), and verifies `:8003 :8002 :8001 :8123` are free afterwards.
 
 Re-running `./run.sh` is safe: it clears a stale bridge on `:8080` and skips
 MCP servers that are already up. Logs for every process are in
@@ -125,7 +147,7 @@ Manual mode (one terminal per process), if you prefer:
 
 ## Tools
 
-Twenty-six tools live on the tools MCP server (`:8003`). Twenty-four are
+Thirty-one tools live on the tools MCP server (`:8003`). Twenty-nine are
 things you can ask for by voice; two (`pop_finished_timers`, `music_state`)
 are internal — the bridge filters them out of the LLM's tool list and polls
 them itself.
@@ -134,8 +156,8 @@ them itself.
 |---|---|---|---|
 | **Time** | `get_time` | Current local date/time | "what time is it?" |
 | **Weather** | `get_weather` | Forecast for a place (defaults to `DEFAULT_CITY`) | "will it rain in Manila?" |
-| **Web** | `web_search` | DuckDuckGo news/web results | "search for …" |
-| **Web** | `wikipedia` | First paragraph of an article | "who is …?" |
+| **Web** | `web_search` | Web results via a fallback chain (DuckDuckGo → Brave → Mojeek → Startpage → Yahoo); names the engine that answered | "search for …" |
+| **Web** | `wikipedia` | First paragraph of an article (retries through Wikimedia rate limits) | "who is …?" |
 | **Timers** | `set_timer` | Countdown; announced when it fires | "set a 10 minute timer for pasta" |
 | | `list_timers` | Show running timers + time left | "what timers are running?" |
 | | `cancel_timer` | Cancel by label or id | "cancel the pasta timer" |
@@ -144,6 +166,11 @@ them itself.
 | | `delete_note` | Remove notes matching a phrase | "delete the reminder about eggs" |
 | | `clear_notes` | Delete all notes | "clear my notes" |
 | **System** | `system_status` | Pi CPU temp, load, memory, uptime, IP | "how's the Pi doing?" |
+| **Smart home** | `set_lights` | Lights on/off + brightness + colour via Home Assistant | "turn on the lights" / "dim the lights to 50%" |
+| | `set_thermostat` | Thermostat target temperature via Home Assistant | "set the temperature to 22" |
+| | `get_temperature` | Current room temperature (+ target) via Home Assistant | "what's the current temperature?" |
+| **Calls** | `call_contact` | Sends the contact a Telegram call-BACK request (bots can't initiate calls - this is the closest the Bot API allows). The recipient is matched against the bot's learned contacts, then Contacts.app | "call Mom" / "call Dad on video" |
+| | `send_message` | Telegram message via the Bot API (recipients learned from incoming bot messages; unknown ones go to the owner's chat with an honest note) | "text Dad that I'll be late" |
 | **Music** | `music_search` | Find tracks/albums/artists/playlists | "search for lo-fi playlists" |
 | | `music_play` | Play a track/album/playlist (optionally on a device) | "play Bohemian Rhapsody" |
 | | `music_pause` / `music_resume` | Pause / continue | "pause" / "go ahead" |
@@ -180,7 +207,7 @@ WebSocket:
 | `web.server` (bridge) | `8080` | The orchestrator. `web/server.py` wires the routes and lifecycle; the `web/core/` modules run VAD, own the conversation, drive the LLM, coordinate barge-in, and stream audio to/from the browser over a WebSocket. |
 | `mcp_servers.asr_server` | `8001` | Speech-to-text (Groq Whisper). |
 | `mcp_servers.tts_server` | `8002` | Text-to-speech (local Piper, fully offline). |
-| `mcp_servers.tools_server` | `8003` | All 26 tools, including Spotify (via `mcp_servers/spotify.py`). |
+| `mcp_servers.tools_server` | `8003` | All 31 tools, including Spotify (via `mcp_servers/spotify.py`). |
 
 The bridge keeps a persistent connection to each MCP server, probes every 10 s,
 and reconnects automatically if one dies.
@@ -199,8 +226,11 @@ Wire protocol (binary audio, low overhead):
   frames; JSON text frames carry control only (`{"type":"ready"}`).
 - **server → client:** uint16 LE sample rate + 16-bit LE mono PCM, one TTS
   chunk per frame; JSON text frames carry control (`text`, `transcript`,
-  `transcript_fix`, `barge`, `duck`, `unduck`, `processing`, `tool`, `done`,
-  `error`, `silence`, `bye`).
+  `transcript_fix`, `barge`, `duck`, `unduck`, `processing`, `tool_start`,
+  `tool_done`, `done`, `error`, `silence`, `bye`). `tool_start`/`tool_done`
+  are the command-notification frames: `{key, cat, title, sub, err}`, where
+  `key` matches the two phases of one tool call (the UI flips the banner in
+  place) and `cat` is one of the ten command families.
 
 ### Turn detection (VAD)
 
@@ -332,7 +362,7 @@ most likely to touch first:
 | Key | Default | Meaning |
 |---|---|---|
 | `GROQ_API_KEY` | — | **Required.** Free key from https://console.groq.com/keys |
-| `GROQ_LLM_MODEL` | `openai/gpt-oss-20b` | Primary LLM |
+| `GROQ_LLM_MODEL` | `openai/gpt-oss-120b` | Primary LLM |
 | `VAD_MIN_VOLUME` | `0.7` | Loudness floor — raise if TV/room noise triggers turns |
 | `VAD_BARGE_MS` | `200` | Speech burst (ms) that cuts the bot mid-reply (barge-in speed vs TV false cuts) |
 | `IDLE_PROMPT_SECS` / `IDLE_CHECK_SECS` | `50` / `70` | Silence before the spoken "still there?" check-in / before the mic turns off |
@@ -345,7 +375,7 @@ most likely to touch first:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `GROQ_LLM_MODEL` | `openai/gpt-oss-20b` | Primary LLM |
+| `GROQ_LLM_MODEL` | `openai/gpt-oss-120b` | Primary LLM |
 | `GROQ_LLM_MODELS` | — | Comma-separated failover chain tried in order on quota errors (429) |
 | `LLM_TEMPERATURE` | `0.8` | Sampling consistency for voice replies |
 | `LLM_MAX_TOKENS` | `768` | Bounds a runaway generation |
@@ -420,6 +450,10 @@ most likely to touch first:
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | From a Spotify app (developer.spotify.com). Required by every music tool; search additionally works before the one-time account link |
 | `SPOTIFY_REDIRECT_URI` | `http://127.0.0.1:8080/callback` | Must match the app's redirect URI exactly |
 | `MUSIC_VOLUME_STEP` | `10` | Steps for direction-only volume words ("louder" = +10, "quieter" = −10) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Telegram Bot API credentials (create a bot with @BotFather; `TELEGRAM_CHAT_ID` is your own chat id, read back from `getUpdates`). `TELEGRAM_BOT_TOKEN` is required by `call_contact` and `send_message`; without it those tools return an honest "Telegram isn't configured" error |
+| `HASS_URL` / `HASS_TOKEN` | — | Home Assistant base URL and a long-lived access token (Profile → Security). Required by `set_lights`, `set_thermostat` and `get_temperature`; without them those tools return an honest "no hub connected" error |
+| `HASS_LIGHT_ENTITY` | `light.living_room` | Fallback light entity when no spoken room name matches (set empty to disable) |
+| `HASS_CLIMATE_ENTITY` | — | Fallback climate entity when no thermostat name matches |
 | `LAVA_DEVICE` | auto (`pi` / `desktop`) | Deployment profile — auto-detected from the hostname; set `pi` on a Raspberry Pi to get Pi-appropriate advice (a headless Pi has no Spotify desktop app, so web-player warnings point to a Connect receiver instead) |
 
 **Idle & infrastructure**
@@ -483,6 +517,68 @@ work even before linking. Playback controls need the linked account **and a
 Spotify Premium subscription** — free accounts get a clear spoken explanation
 instead. If no device is active, Lava auto-transfers to a lone device, or asks
 which of several to use.
+
+---
+
+## Smart home (Home Assistant)
+
+Lava controls lights and the thermostat through Home Assistant's REST API —
+no third-party cloud, everything stays on your network. Three tools cover the
+families: `set_lights` (on/off + brightness + colour), `set_thermostat`
+(target temperature) and `get_temperature` (current reading + target).
+
+**Virtual devices, no hardware.** The repo ships a ready-made HA
+configuration (`ha/configuration.yaml`) with two virtual lights
+(`light.living_room`, `light.kitchen`) and a virtual thermostat
+(`climate.living_room_thermostat`, a `generic_thermostat` reading an
+editable input — the supported way to make a virtual one in HA 2026.x,
+where the old `template` climate platform was removed) — nothing to plug
+in. Every change Lava makes shows up live on the HA dashboard, so you can
+watch the light card toggle/dim and the thermostat card move while talking.
+
+### Setup — dev machine (this Mac)
+
+```bash
+./ha/start_ha.sh                      # venv + first boot (~1 min), seeds HASS_TOKEN
+./deploy/start_all.sh                 # the three MCP servers (tools reads .env at start)
+.venv/bin/python -m web.server        # the bridge
+.venv/bin/python ha/test_integration.py   # end-to-end: voice pipeline -> HA state
+```
+
+`ha/start_ha.sh` creates `ha/venv` (needs Python 3.13), boots Home Assistant
+on `http://127.0.0.1:8123`, finishes first-boot onboarding non-interactively
+(admin user `lava`, password `lava090201`), mints a
+long-lived access token through HA's own auth API, and writes `HASS_URL` /
+`HASS_TOKEN` into `.env`. `./ha/stop_ha.sh` stops it again.
+
+### Setup — Raspberry Pi (recommended: Docker)
+
+```bash
+sudo apt install docker.io docker-compose-plugin
+cd lava/deploy/home-assistant
+docker compose up -d
+```
+
+Then: open `http://<pi-ip>:8123`, create the admin account, mint a token
+(Profile → Security → Long-Lived Access Tokens), and add to the Pi's `.env`:
+
+```
+HASS_URL=http://<pi-ip>:8123
+HASS_TOKEN=<the token>
+```
+
+Restart the tools MCP (`./deploy/stop_all.sh && ./deploy/start_all.sh`).
+The same `ha/configuration.yaml` is mounted into the container, so the
+virtual entities are identical. Budget ~300–400 MB extra RAM for the HA
+container on a Pi 4 (4 GB) — comfortably alongside Lava's ~0.5 GB.
+
+### Verifying the dashboard really updates
+
+`ha/test_integration.py` drives the **same pipeline a spoken command uses**
+(the bridge's `POST /api/run` → tools MCP → HA REST) and then re-reads
+`/api/states` to prove the hub's state changed: light on → brightness ≈ 30%
+→ target 22 °C → temperature read-back → light off. Nothing is simulated on
+the Lava side; every assertion is against Home Assistant's own state.
 
 ---
 
@@ -571,11 +667,18 @@ lava/
 ├── .env                    # all configuration (git-ignored — holds API keys)
 ├── deploy/
 │   ├── start_all.sh        # starts the three MCP servers only
-│   └── stop_all.sh         # stops them
+│   ├── stop_all.sh         # stops them + the HA hub (logs/ha.pid, :8123)
+│   └── home-assistant/     # docker-compose for the Pi (HA container)
+├── ha/                     # virtual Home Assistant hub (no hardware)
+│   ├── configuration.yaml  # virtual lights + thermostat entities
+│   ├── start_ha.sh         # dev-machine launcher (seeds HASS_TOKEN)
+│   ├── stop_ha.sh
+│   ├── seed_token.py       # finishes onboarding + mints the long-lived token
+│   └── test_integration.py # end-to-end: voice pipeline -> HA state
 ├── mcp_servers/            # asr_server, tts_server, tools_server, spotify, common
 ├── web/
 │   ├── server.py           # entry point: HTTP/WebSocket routes + lifecycle
-│   ├── core/               # config, state, mcp_client, llm, vad, speech, music, turn
+│   ├── core/               # config, state, mcp_client, llm, vad, speech, music, turn, notifications
 │   └── index.html          # orb UI
 ├── models/piper/           # Piper voice, auto-downloaded on first use
 └── logs/                   # <name>.log (rotated), <name>.pid, notes.json, spotify_token.json
@@ -588,6 +691,7 @@ HTTP/WebSocket endpoints served by the bridge (`:8080`):
 | `GET /` | The orb UI (`index.html`) |
 | `GET /ws` | Audio + control WebSocket (the conversation) |
 | `GET /api/status` | Live model, loaded tools, city, session count, `fd_metrics` |
+| `POST /api/run` | Execute one tool outside a voice turn (the commands tray); banner frames fan out to ready sessions, or come back in the response |
 | `GET /spotify/auth` | One-time Spotify account link (redirects to Spotify) |
 | `GET /callback` | Spotify OAuth callback (stores the refresh token) |
 | `GET /favicon.png` | Icon |
@@ -603,6 +707,10 @@ HTTP/WebSocket endpoints served by the bridge (`:8080`):
   (`logs/*`, with only `notes.json` re-included). Treat the file like a
   password.
 - **`logs/notes.json`** is the one tracked log file (your saved notes).
+- **`POST /api/run` executes tools** - treat it like the mic: it lives
+  behind the same bind address as the rest of the bridge (`127.0.0.1` by
+  default). Only expose it deliberately (if you set `WEB_HOST=0.0.0.0`,
+  the LAN can run tools from a browser tab).
 - The web bridge binds `WEB_HOST` (default `127.0.0.1` — loopback only); the
   three MCP servers bind `MCP_HOST` (default `127.0.0.1`). Nothing is exposed
   to the network unless you set `WEB_HOST=0.0.0.0` (headless Pi) or change

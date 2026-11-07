@@ -8,4 +8,5 @@ vad         Silero VAD + Full-Duplex-Bench overlap classification
 speech      TTS cache, sentence splitting, pipelined Speaker
 music       Spotify music-command fast path
 turn        utterance flow (ASR -> LLM -> TTS) and barge-in handling
+notifications  maps tool calls to the ten command families for the UI toasts
 """

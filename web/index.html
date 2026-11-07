@@ -253,12 +253,203 @@
     border-bottom-left-radius: 5px;
   }
 
+  /* ---------- command notifications (toasts) ----------
+     Transient banners for the ten command families. The server computes the
+     display strings (cat / title / sub / err) and sends tool_start (while the
+     tool runs) then tool_done (final). We render, dedupe by key, and dismiss.
+     Anchored top-right: clear of the centered orb, the top-center banners,
+     and the left wordmark. Transform/opacity only (compositor-friendly). */
+  .toast-host {
+    position: fixed; bottom: 16px; right: 16px; z-index: 20;
+    display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+    pointer-events: none;
+    max-width: min(320px, calc(100vw - 24px));
+  }
+  .toast {
+    --cat: var(--dim);
+    position: relative;
+    display: flex; align-items: flex-start; gap: 9px;
+    width: min(300px, calc(100vw - 24px));
+    padding: 9px 11px 9px 12px;
+    background: rgba(18, 12, 9, 0.82);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--cat);
+    border-radius: 12px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    pointer-events: auto;
+    cursor: pointer;
+    opacity: 0; transform: translateX(14px);
+    transition: opacity .22s ease, transform .22s cubic-bezier(.2, .7, .3, 1);
+    overflow: hidden;
+  }
+  .toast.in { opacity: 1; transform: none; }
+  .toast.out { opacity: 0; transform: translateX(14px); transition: opacity .18s ease, transform .18s ease; }
+  /* category accents (cohesive, mid-saturation on the dark stage) */
+  .cat-music { --cat: #f97316; }  .cat-media { --cat: #fb923c; }
+  .cat-query { --cat: #38bdf8; }  .cat-lights { --cat: #fbbf24; }
+  .cat-dim { --cat: #f59e0b; }    .cat-timer { --cat: #34d399; }
+  .cat-alarm { --cat: #f87171; }  .cat-thermostat { --cat: #60a5fa; }
+  .cat-reminder { --cat: #a78bfa; } .cat-calls { --cat: #4ade80; }
+  .cat-system { --cat: #94a3b8; }
+  .cat-unknown { --cat: #9a8d84; }
+  .cmd-group {
+    font-size: 9px; font-weight: 600; letter-spacing: 0.18em; text-transform: uppercase;
+    color: rgba(240, 200, 170, 0.42);
+    padding: 9px 11px 3px;
+  }
+  .cmd-group:first-child { padding-top: 5px; }
+  /* status icon: spinner (running) / check (ok) / x (error) */
+  .toast-icon {
+    flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--cat);
+  }
+  .toast.is-ok .toast-icon { color: var(--ok); }
+  .toast.is-err .toast-icon { color: #f87171; }
+  .toast.is-spin .toast-icon::before {
+    content: ""; width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.14); border-top-color: var(--cat);
+    animation: toastspin .7s linear infinite;
+  }
+  @keyframes toastspin { to { transform: rotate(360deg); } }
+  .toast-icon svg { display: block; }
+  .toast-body { flex: 1 1 auto; min-width: 0; }
+  .toast-title {
+    font-size: 12.5px; font-weight: 600; line-height: 1.3; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .toast-sub {
+    font-size: 11px; font-weight: 400; line-height: 1.4; color: var(--dim);
+    margin-top: 1px; white-space: normal; overflow-wrap: anywhere;
+    max-height: 96px; overflow-y: auto;
+  }
+  .toast.is-err .toast-sub { color: #fca5a5; }
+  /* dismiss affordance, revealed on hover only */
+  .toast-x {
+    flex: 0 0 auto; font-size: 15px; line-height: 1; color: var(--dim);
+    opacity: 0; transition: opacity .15s ease; padding: 0 1px;
+  }
+  .toast:hover .toast-x { opacity: .8; }
+  @media (max-width: 480px) {
+    .toast-host { bottom: 12px; right: 12px; }
+    .toast { width: calc(100vw - 24px); }
+  }
+
+  /* ---------- commands tray ----------
+     The UI surface for the ten command families: a quiet launcher
+     (bottom-right) that expands into a compact list. Clicking a command
+     fires the same toast pipeline the server uses for real tool calls
+     (spin -> ok, shift-click previews the error state), so what you see
+     here is exactly what a spoken command produces. Closed by default -
+     the voice UI stays the hero, this is a preview/discovery surface. */
+  .cmd-launch {
+    position: fixed; right: 16px; top: 16px; z-index: 18;
+    display: flex; align-items: center; gap: 8px;
+    font-family: inherit; /* buttons don't inherit by default */
+    font-size: 10.5px; font-weight: 600; letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dim);
+    background: rgba(18, 12, 9, 0.72);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 9px 14px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    cursor: pointer;
+    transition: color .2s ease, border-color .2s ease;
+  }
+  .cmd-launch:hover, .cmd-launch:focus-visible {
+    color: var(--text);
+    border-color: rgba(255, 190, 150, 0.24);
+  }
+  body.cmd-open .cmd-launch { color: var(--text); border-color: rgba(255, 190, 150, 0.24); }
+
+  .cmd-tray {
+    position: fixed; right: 16px; top: 56px; z-index: 19;
+    width: min(268px, calc(100vw - 32px));
+    background: rgba(18, 12, 9, 0.86);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    padding: 10px 7px 8px;
+    opacity: 0; transform: translateY(-8px); visibility: hidden; pointer-events: none;
+    transition: opacity .2s ease, transform .2s cubic-bezier(.2, .7, .3, 1),
+                visibility 0s linear .2s;
+  }
+  .cmd-tray.open {
+    opacity: 1; transform: none; visibility: visible; pointer-events: auto;
+    transition: opacity .2s ease, transform .2s cubic-bezier(.2, .7, .3, 1);
+  }
+  .cmd-head {
+    display: flex; flex-direction: column; gap: 2px;
+    padding: 0 11px 8px; border-bottom: 1px solid var(--border);
+  }
+  .cmd-head .cmd-title {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.22em;
+    text-transform: uppercase; color: rgba(240, 200, 170, 0.55);
+  }
+  .cmd-head .cmd-hint {
+    font-size: 10px; font-weight: 400; color: rgba(154, 141, 132, 0.75);
+  }
+  .cmd-list {
+    max-height: min(46vh, 400px);
+    overflow-y: auto; overscroll-behavior: contain;
+    scrollbar-width: thin; scrollbar-color: rgba(255,190,150,0.18) transparent;
+    padding: 4px 0 4px;
+  }
+  .cmd-list::-webkit-scrollbar { width: 6px; }
+  .cmd-list::-webkit-scrollbar-thumb { background: rgba(255,190,150,0.18); border-radius: 3px; }
+  .cmd-row {
+    display: flex; align-items: center; gap: 9px;
+    width: 100%; text-align: left;
+    background: none; border: 0;
+    font-family: inherit; font-size: 12px; font-weight: 500; line-height: 1.4;
+    color: var(--dim);
+    padding: 8px 11px; border-radius: 9px;
+    cursor: pointer;
+    transition: background .15s ease, color .15s ease;
+  }
+  .cmd-row:hover, .cmd-row:focus-visible {
+    background: rgba(255, 214, 178, 0.06);
+    color: var(--text);
+  }
+  .cmd-row:focus-visible { outline: 1px solid rgba(255, 190, 150, 0.35); outline-offset: -1px; }
+  /* the per-command accent reuses the toast categories (.cat-* set --cat) */
+  .cmd-row .cmd-cat {
+    width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--cat);
+    transition: box-shadow .15s ease;
+  }
+  .cmd-row:hover .cmd-cat { box-shadow: 0 0 8px var(--cat); }
+  @media (max-width: 480px) {
+    .cmd-launch { right: 12px; top: 12px; padding: 8px 12px; }
+    .cmd-tray { right: 12px; top: 52px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .toast, .toast.out { transition: opacity .12s ease; transform: none; }
+    .toast.is-spin .toast-icon::before { animation-duration: 1.2s; }
+    .cmd-tray, .cmd-launch, .cmd-row { transition: none; animation: none; }
+  }
+
 </style>
 </head>
 <body>
 
 <div class="sound-banner" id="soundBanner">🔇 tap anywhere to unlock sound</div>
 <div class="mic-banner" id="micBanner"><div id="micBannerMsg"></div><button id="micRetryBtn">Retry microphone</button></div>
+<div class="toast-host" id="toastHost" aria-live="polite"></div>
+
+<div class="cmd-tray" id="cmdTray" role="group" aria-label="Command notifications preview">
+  <div class="cmd-head">
+    <div class="cmd-title">command notifications</div>
+    <div class="cmd-hint">every command Lava can do · click to run</div>
+  </div>
+  <div class="cmd-list" id="cmdList"></div>
+</div>
+<button class="cmd-launch" id="cmdLaunch" aria-expanded="false" aria-controls="cmdTray" aria-label="Open command notifications tray">
+  commands
+</button>
 
 <div class="brand">
   <div class="name"><span class="w">l</span><span class="w">a</span><span class="mo">v</span><span class="mo">a</span><span class="dot"></span></div>
@@ -844,6 +1035,336 @@ function duckBot(on) {
   if (on) duckTimer = setTimeout(() => { duckTimer = null; duckBot(false); }, 2500);
 }
 
+// ---------------- command notifications (toasts) ----------------
+// The server sends tool_start (optimistic, while the tool runs) and
+// tool_done (final) frames carrying pre-computed display strings:
+//   {type, key, cat, title, sub, err}
+// We render one toast per unique key (dedupe: two identical "pause"s are
+// one toast), flip it in place on done, and auto-dismiss. States:
+//   spin  -> running (spinner, no timer)
+//   ok    -> success (check, dismisses in ~3.2 s)
+//   err   -> failure (x + error line, dismisses in ~6 s)
+const toastHost = document.getElementById("toastHost");
+const TOAST_MAX = 4;          // visible at once; oldest dismisses first
+const TOAST_OK_MS = 3200;
+const TOAST_ERR_MS = 6000;
+const ICON_CHECK = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.2 11.7 13 4.5"/></svg>';
+const ICON_X = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
+const toasts = new Map();     // key -> {el, state, timer, hover}
+
+function toastEl(cat, title, sub) {
+  const el = document.createElement("div");
+  el.className = `toast cat-${cat || "unknown"}`;
+  const icon = document.createElement("span");
+  icon.className = "toast-icon";
+  const body = document.createElement("div");
+  body.className = "toast-body";
+  const t = document.createElement("div");
+  t.className = "toast-title";
+  t.textContent = title || "Command";
+  body.appendChild(t);
+  if (sub) {
+    const s = document.createElement("div");
+    s.className = "toast-sub";
+    s.textContent = sub;
+    body.appendChild(s);
+  }
+  const x = document.createElement("span");
+  x.className = "toast-x";
+  x.textContent = "×";
+  el.append(icon, body, x);
+  return el;
+}
+
+function toastSetState(rec, state, sub, err) {
+  const el = rec.el;
+  el.classList.remove("is-spin", "is-ok", "is-err");
+  const icon = el.querySelector(".toast-icon");
+  if (state === "spin") {
+    el.classList.add("is-spin");
+    icon.innerHTML = "";
+  } else if (state === "err") {
+    el.classList.add("is-err");
+    icon.innerHTML = ICON_X;
+    const s = el.querySelector(".toast-sub");
+    if (s) s.textContent = err || "Failed";
+  } else {
+    el.classList.add("is-ok");
+    icon.innerHTML = ICON_CHECK;
+    if (sub) {
+      let s = el.querySelector(".toast-sub");
+      if (!s) {
+        s = document.createElement("div");
+        s.className = "toast-sub";
+        el.querySelector(".toast-body").appendChild(s);
+      }
+      s.textContent = sub;
+    }
+  }
+  rec.state = state;
+  // (re)arm the auto-dismiss timer; hover pauses it
+  if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+  if (state === "ok" && !rec.hover) rec.timer = setTimeout(() => toastDismiss(rec.key), TOAST_OK_MS);
+  if (state === "err" && !rec.hover) rec.timer = setTimeout(() => toastDismiss(rec.key), TOAST_ERR_MS);
+}
+
+function toastDismiss(key) {
+  const rec = toasts.get(key);
+  if (!rec || rec.leaving) return;
+  rec.leaving = true;
+  if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+  rec.el.classList.remove("in");
+  rec.el.classList.add("out");
+  setTimeout(() => { rec.el.remove(); toasts.delete(key); }, 200);
+}
+
+function toastShow(m) {
+  // Dedupe: same key updates the existing toast in place (start -> done).
+  let rec = toasts.get(m.key);
+  if (!rec) {
+    // Evict the oldest non-leaving toast past the cap.
+    const live = [...toasts.values()].filter((r) => !r.leaving);
+    if (live.length >= TOAST_MAX) toastDismiss(live[0].key);
+    const el = toastEl(m.cat, m.title, m.sub);
+    el.addEventListener("mouseenter", () => {
+      rec.hover = true;
+      if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+    });
+    el.addEventListener("mouseleave", () => {
+      rec.hover = false;
+      if (rec.state === "ok") rec.timer = setTimeout(() => toastDismiss(m.key), TOAST_OK_MS);
+      if (rec.state === "err") rec.timer = setTimeout(() => toastDismiss(m.key), TOAST_ERR_MS);
+    });
+    el.addEventListener("click", () => toastDismiss(m.key));
+    toastHost.appendChild(el);
+    rec = { key: m.key, el, state: "spin", timer: null, hover: false, leaving: false };
+    toasts.set(m.key, rec);
+    // force a frame so the entrance transition runs
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add("in")));
+  }
+  // Refresh copy (title/sub can resolve on done: track, device, volume %).
+  const t = rec.el.querySelector(".toast-title");
+  if (t && m.title) t.textContent = m.title;
+  if (m.err) toastSetState(rec, "err", null, m.err);
+  else if (m.type === "tool_done") toastSetState(rec, "ok", m.sub, null);
+  else toastSetState(rec, "spin", m.sub, null);
+}
+
+// ---------------- commands tray ----------------
+// The on-screen surface for every command Lava can do, grouped by purpose.
+// Clicking a row runs the real tool through the bridge's POST /api/run (same
+// exec_tool -> notifications pipeline a spoken command uses - real results,
+// real banner frames). Shift-click always previews the failure state; a
+// family whose backend is not linked (no Home Assistant, Spotify offline)
+// executes too and its banner carries the hub's honest error. Where the
+// page's WebSocket session is ready, the live frames arrive over the WS
+// exactly like a voice command; otherwise the run's frames come back in the
+// response and are rendered here with a short spin hold. If the bridge
+// itself is unreachable the run is simulated locally so the surface keeps
+// working standalone. Frames mirror web/core/notifications.py:display()
+// output.
+const CMD_LIST = document.getElementById("cmdList");
+const CMD_TRAY = document.getElementById("cmdTray");
+const CMD_LAUNCH = document.getElementById("cmdLaunch");
+const CMD_ERR_MS_RANGE = [550, 1200];   // simulated run / spin-hold time
+const CMD_ITEMS = [
+  { cat: "query", group: "know", variants: [
+    { phr: "What's the weather?", title: "Weather", out: "Quezon City", done: "Quezon City",
+      tool: "get_weather", args: {} },
+  ]},
+  { cat: "query", group: "know", variants: [
+    { phr: "What time is it?", title: "Time", out: "", done: "",
+      tool: "get_time", args: {} },
+  ]},
+  { cat: "query", group: "know", variants: [
+    { phr: "What's the latest news in AI?", title: "Web search",
+      out: "latest AI news", done: "latest AI news",
+      tool: "web_search", args: { query: "latest AI news" } },
+  ]},
+  { cat: "query", group: "know", variants: [
+    { phr: "Look up artificial intelligence on Wikipedia", title: "Wikipedia",
+      out: "artificial intelligence", done: "artificial intelligence",
+      tool: "wikipedia", args: { topic: "artificial intelligence" } },
+  ]},
+  { cat: "lights", group: "home", variants: [
+    { phr: "Turn on the lights", title: "Lights", out: "Living Room \u00b7 on", done: "Living Room \u00b7 on",
+      tool: "set_lights", args: { room: "living room", on: true } },
+  ]},
+  { cat: "dim", group: "home", variants: [
+    { phr: "Dim the lights to 50%", title: "Dim / color", out: "Living Room \u00b7 50% \u00b7 warm", done: "Living Room \u00b7 50% \u00b7 warm",
+      tool: "set_lights", args: { room: "living room", on: true, brightness_pct: 50, color: "warm" } },
+  ]},
+  { cat: "thermostat", group: "home", variants: [
+    { phr: "Set the temperature to 22\u00b0", title: "Thermostat", out: "set to 22 \u00b0C", done: "set to 22 \u00b0C",
+      tool: "set_thermostat", args: { temperature: 22, unit: "C" } },
+  ]},
+  { cat: "thermostat", group: "home", variants: [
+    { phr: "What's the current temperature?", title: "Temperature", out: "reading", done: "reading",
+      tool: "get_temperature", args: {} },
+  ]},
+  { cat: "timer", group: "time", variants: [
+    { phr: "Set a timer for 5 minutes", title: "Timer", out: "5 mins", done: "5 mins",
+      tool: "set_timer", args: { seconds: 300 } },
+  ]},
+  { cat: "alarm", group: "time", variants: [
+    { phr: "Set an alarm for 6 AM", title: "Alarm", out: "6 AM \u00b7 wake-up", done: "6 AM \u00b7 wake-up",
+      tool: "set_timer", args: () => ({ seconds: cmdSecsUntil(6), label: "6 AM" }) },
+  ]},
+  { cat: "music", group: "listen", variants: [
+    { phr: "Play music", title: "Play music", out: "Bohemian Rhapsody", done: "Bohemian Rhapsody \u00b7 MacBook Pro",
+      tool: "music_play", args: { query: "Bohemian Rhapsody" } },
+  ]},
+  { cat: "media", group: "listen", variants: [
+    { phr: "Pause", title: "Pause", out: "", done: "",
+      tool: "music_pause", args: {} },
+    { phr: "Next track", title: "Next track", out: "", done: "",
+      tool: "music_skip", args: { direction: "next" } },
+    { phr: "Volume up", title: "Volume", out: "+10", done: "40%",
+      tool: "music_volume", args: { level: "+10" } },
+    { phr: "What's playing?", title: "Now playing", out: "", done: "",
+      tool: "music_now_playing", args: {} },
+  ]},
+  { cat: "system", group: "system", variants: [
+    { phr: "How's the Pi doing?", title: "System", out: "checking", done: "checking",
+      tool: "system_status", args: {} },
+  ]},
+  { cat: "reminder", group: "remind", variants: [
+    { phr: "Remind me to drink water", title: "Reminder", out: "drink water", done: "drink water",
+      tool: "add_note", args: { text: "drink water" } },
+  ]},
+  { cat: "calls", group: "people", variants: [
+    { phr: "Call Mom", title: "Call", out: "Mom \u00b7 call request", done: "Mom \u00b7 Telegram call request",
+      tool: "call_contact", args: { contact: "Mom" } },
+    { phr: "Message Hannah 'hello there!'", title: "Message", out: "Hannah: \u201chello there!\u201d \u00b7 sending", done: "Hannah: \u201chello there!\u201d",
+      tool: "send_message", args: { recipient: "Hannah", message: "hello there!" } },
+  ]},
+];
+// Failure copy. Shift-click previews these; with the bridge offline they are
+// also the honest fallback per family.
+const CMD_FAIL = {
+  music: "Spotify Premium required",
+  query: "Lookup timed out",
+  lights: "No smart home hub connected",
+  dim: "No smart home hub connected",
+  timer: "Timer failed to start",
+  alarm: "Clock service error",
+  thermostat: "No smart home hub connected",
+  media: "No active Spotify device",
+  system: "Pi sensors unavailable",
+  reminder: "Note store unavailable",
+  calls: "Telegram not configured",
+};
+
+// Seconds until the next occurrence of a clock time (real alarm via
+// set_timer + the bridge's announce loop, exactly as a spoken alarm does).
+function cmdSecsUntil(hour) {
+  const now = new Date();
+  const t = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour);
+  if (t <= now) t.setDate(t.getDate() + 1);
+  return Math.max(1, Math.round((t.getTime() - now.getTime()) / 1000));
+}
+
+function cmdHold(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function cmdRun(item, vi, fail, si) {
+  const idx = vi % item.variants.length;
+  const v = item.variants[idx];
+  // si (item index) in the key: several rows share a category (weather /
+  // time / web search / wikipedia are all "query"), so cat+variant would
+  // collide and one toast would flip in place for a different command.
+  const key = `demo:${si}:${idx}`;
+  const base = { cat: item.cat, title: v.title };
+  if (fail || !v.tool) {
+    // Failure preview, or a family with no backend: honest status banner.
+    toastShow({ type: "tool_start", key, ...base, sub: v.out, err: null });
+    await cmdHold(CMD_ERR_MS_RANGE[0] + (v.tool ? Math.random() * (CMD_ERR_MS_RANGE[1] - CMD_ERR_MS_RANGE[0]) : 400));
+    toastShow({ type: "tool_done", key, ...base, sub: v.out, err: CMD_FAIL[item.cat] || "Failed" });
+    return;
+  }
+  // Real run. The bridge executes the tool with the same pipeline as a
+  // spoken command; its frames carry the real result copy.
+  let data = null;
+  try {
+    const r = await fetch("/api/run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tool: v.tool, args: typeof v.args === "function" ? v.args() : v.args }),
+    });
+    data = await r.json();
+  } catch (e) { /* bridge offline - fall through to the simulated run */ }
+  if (data && data.ok && data.frames && data.frames.length === 2) {
+    if (!data.broadcast) {
+      // No ready WS session here: render the run's own frames locally.
+      toastShow(data.frames[0]);
+      await cmdHold(CMD_ERR_MS_RANGE[0] + Math.random() * 450);
+      toastShow(data.frames[1]);
+    }
+    // broadcast=true: the ready sessions got the live frames over the WS.
+    return;
+  }
+  if (data && data.ok === false) {
+    // Bridge rejected the call (tool unknown / internal): show why.
+    toastShow({ type: "tool_start", key, ...base, sub: v.out, err: null });
+    toastShow({ type: "tool_done", key, ...base, sub: v.out, err: data.error || "Failed" });
+    return;
+  }
+  // Offline fallback: simulated pipeline with the example copy.
+  toastShow({ type: "tool_start", key, ...base, sub: v.out, err: null });
+  await cmdHold(CMD_ERR_MS_RANGE[0] + Math.random() * (CMD_ERR_MS_RANGE[1] - CMD_ERR_MS_RANGE[0]));
+  toastShow({ type: "tool_done", key, ...base, sub: v.done, err: null });
+}
+
+function cmdBuildRows() {
+  let lastGroup = null;
+  CMD_ITEMS.forEach((item, si) => {
+    if (item.group !== lastGroup) {
+      const gh = document.createElement("div");
+      gh.className = "cmd-group";
+      gh.textContent = item.group || "commands";
+      CMD_LIST.appendChild(gh);
+      lastGroup = item.group;
+    }
+    let vi = 0;
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `cmd-row cat-${item.cat}`;
+    const dot = document.createElement("span");
+    dot.className = "cmd-cat";
+    dot.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.className = "cmd-label";
+    label.textContent = item.variants[0].phr;
+    row.append(dot, label);
+    row.addEventListener("click", (e) => {
+      cmdRun(item, vi, e.shiftKey, si);
+      // Multi-command families cycle their example on each run; the label
+      // previewing the NEXT click keeps the row honest about what it does.
+      vi = (vi + 1) % item.variants.length;
+      if (item.variants.length > 1) label.textContent = item.variants[vi].phr;
+    });
+    CMD_LIST.appendChild(row);
+  });
+}
+
+function cmdSetOpen(open) {
+  CMD_TRAY.classList.toggle("open", open);
+  CMD_LAUNCH.setAttribute("aria-expanded", String(open));
+  CMD_LAUNCH.setAttribute("aria-label", open ? "Close command notifications tray" : "Open command notifications tray");
+  document.body.classList.toggle("cmd-open", open);
+}
+CMD_LAUNCH.addEventListener("click", () => cmdSetOpen(!CMD_TRAY.classList.contains("open")));
+// Dismissal: Escape closes; clicking outside the tray/launcher closes it.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && CMD_TRAY.classList.contains("open")) cmdSetOpen(false);
+});
+document.addEventListener("pointerdown", (e) => {
+  if (CMD_TRAY.classList.contains("open") &&
+      !CMD_TRAY.contains(e.target) && !CMD_LAUNCH.contains(e.target)) cmdSetOpen(false);
+}, true);
+cmdBuildRows();
+
 // ---------------- websocket ----------------
 function connect() {
   connPhase = "retrying";  // concerned face while attempting
@@ -883,6 +1404,10 @@ function connect() {
       // backchannel over the bot must not flicker the state away from
       // "speaking" (the bot keeps talking in that case).
       if (running && !botPlaying) setState("thinking");
+    } else if (m.type === "tool_start" || m.type === "tool_done") {
+      // Command notification: a tool is starting (spin) or finished
+      // (ok/err). The server already computed cat/title/sub/err.
+      toastShow(m);
     } else if (m.type === "transcript") {
       stopBotAudio();   // barge-in: user spoke over the agent
       addUser(m.text);
