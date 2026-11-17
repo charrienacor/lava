@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "asr": {
+      "type": "stdio",
+      "command": ".venv/bin/python",
+      "args": ["mcp/asr_server.py"],
+      "env": {
+        "GROQ_API_KEY": "${GROQ_API_KEY}"
+      }
+    },
+    "tts": {
+      "type": "stdio",
+      "command": ".venv/bin/python",
+      "args": ["mcp/tts_server.py"]
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/x/all",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PAT}"
+      }
+    },
+    "spotify": {
+      "type": "http",
+      "url": "https://spotify-mcp.charrienacor.workers.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SPOTIFY_ACCESS_TOKEN}"
+      }
+    },
+    "tavily": {
+      "type": "http",
+      "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}"
+    },
+    "time": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone=Asia/Manila"]
+    }
+  }
+}

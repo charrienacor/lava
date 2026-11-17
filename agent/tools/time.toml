@@ -1,0 +1,20 @@
+# Tools exposed by the 'time' MCP server (3 found).
+# Flip `enabled` to choose what the LLM sees; read directly at startup.
+
+[server]
+name = "time"
+
+[[tool]]
+name = "convert_time"
+description = "Convert time between timezones"
+enabled = true
+
+[[tool]]
+name = "get_current_time"
+description = "Get current time in a specific timezone"
+enabled = true
+
+[[tool]]
+name = "get_time_ago"
+description = "Get the time a given number of days, hours, minutes and seconds ago in a specific timezone"
+enabled = false

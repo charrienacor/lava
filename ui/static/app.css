@@ -1,0 +1,642 @@
+  /* JetBrains Mono, self-hosted (variable 400–700, latin): the UI renders
+     identically with no network — Google Fonts was a remote dependency for
+     a local-first app. The font stack's ui-monospace fallback still covers
+     anything this subset lacks (★, ○ come from system fonts either way). */
+  @font-face {
+    font-family: "JetBrains Mono";
+    src: url("/static/fonts/JetBrainsMono.woff2") format("woff2");
+    font-weight: 400 700;
+    font-style: normal;
+    font-display: swap;
+  }
+  :root {
+    --panel: rgba(255, 214, 178, 0.05);
+    --border: rgba(255, 190, 150, 0.10);
+    --text: #f2e9e2;
+    --dim: #9a8d84;
+    --accent: #f97316;
+    --ok: #34d399;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(120% 90% at 50% 34%, #100a07 0%, #0a0706 42%, #050403 100%);
+    color: var(--text);
+    font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  /* film grain over the whole stage (static, zero JS cost) */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    opacity: 0.045;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    z-index: 5;
+  }
+
+  /* ---------- wordmark (upper left) ---------- */
+  .brand {
+    position: fixed;
+    top: 20px; left: 24px;
+    z-index: 5;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  /* the wordmark: white "lav", and a molten trailing "a" tying back to the orb */
+  .brand .name {
+    font-family: Helvetica, "Helvetica Neue", Arial, sans-serif; /* wordmark stays off the mono stack */
+    font-size: 27px; font-weight: 700; letter-spacing: -0.4px;
+    line-height: 1.15;
+    -webkit-text-fill-color: transparent; color: transparent;
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 14px rgba(249, 115, 22, 0.32));
+    transition: filter 1.4s ease, opacity 1.4s ease;
+  }
+  .brand .name span { font-style: normal; }
+  /* "la" — clean glass: one bright frosted fill (light catching the top of
+     the glyph, warming toward the base) and a soft bloom.
+     A barely-there gloss drift keeps it feeling alive. */
+  .brand .name .w {
+    background: linear-gradient(180deg,
+      #ffffff 0%,
+      rgba(255,255,255,0.92) 30%,
+      rgba(255,248,240,0.72) 62%,
+      rgba(255,236,216,0.82) 100%);
+    background-size: 100% 120%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text; background-clip: text;
+    text-shadow: 0 0 12px rgba(255, 246, 234, 0.22);
+    animation: glassDrift 9s ease-in-out infinite;
+  }
+  @keyframes glassDrift {
+    0%, 100% { background-position: 0% 0%; }
+    50%      { background-position: 0% 100%; }
+  }
+  /* the trailing "a" — a tiny lava planet (orb ramp, upper-left key light) */
+  .brand .name .mo {
+    background: radial-gradient(circle at 32% 30%,
+      #fff0dc 0%, #ffd098 6%, #fba252 14%, #f07422 26%,
+      #d04a0e 41%, #8e2c0a 58%, #4a1808 82%);
+    background-size: 100% 100%;
+    background-position: 50% 50%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text; background-clip: text;
+    animation: moltenBreath 7s ease-in-out infinite;
+  }
+  @keyframes moltenBreath {
+    0%, 100% { background-size: 100% 100%; }
+    50%      { background-size: 165% 165%; }
+  }
+  /* the full-stop beside the "a" — a tiny molten orb on the same ramp */
+  .brand .name .dot {
+    display: inline-block;
+    width: 0.28em; height: 0.28em;
+    margin-left: 0.12em;
+    border-radius: 50%;
+    background: radial-gradient(circle at 32% 30%,
+      #fff0dc 0%, #ffd098 6%, #fba252 14%, #f07422 26%,
+      #d04a0e 41%, #8e2c0a 58%, #4a1808 82%);
+    background-size: 100% 100%;
+    background-position: 50% 50%;
+    background-repeat: no-repeat;
+    vertical-align: baseline;
+    animation: moltenBreath 7s ease-in-out infinite;
+  }
+  /* the wordmark rides the same state machine as the planet (body classes
+     set in setState()): dim when idle, hot while thinking, warm swell
+     while speaking, a touch brighter while listening */
+  body.idle .brand .name { opacity: 0.88; }
+  body.listening .brand .name {
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 8px rgba(255, 150, 74, 0.28));
+  }
+  body.thinking .brand .name {
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 11px rgba(255, 140, 60, 0.45));
+  }
+  body.speaking .brand .name {
+    filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.5))
+            drop-shadow(0 0 9px rgba(255, 130, 56, 0.38));
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .brand .name span { animation: none; }
+    .orb-zone { transition: none; }
+    .bubble { animation: none; }  /* no pop-in on new messages */
+  }
+
+  /* ---------- sound-unlock banner (upper right, with the toasts) ---------- */
+  .sound-banner {
+    position: fixed; top: 64px; right: 24px; transform: translateY(-8px);
+    background: rgba(249,115,22,0.12);
+    border: 1px solid rgba(255,150,80,0.4);
+    color: #ffd9b8; font-size: 13px; font-weight: 600;
+    padding: 10px 18px; border-radius: 999px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s;
+    z-index: 10; white-space: nowrap;
+  }
+  .sound-banner.show { opacity: 1; transform: translateY(0); }
+
+  /* ---------- mic-denied banner (upper right, with the toasts) ---------- */
+  .mic-banner {
+    position: fixed; top: 64px; right: 24px; transform: translateY(-10px) scale(0.98);
+    background: linear-gradient(160deg, rgba(38,20,8,0.82), rgba(24,14,6,0.88));
+    border: 1px solid rgba(255,160,90,0.22);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.06) inset,
+      0 8px 32px rgba(0,0,0,0.45),
+      0 2px 8px rgba(249,115,22,0.08);
+    color: rgba(244,227,211,0.75); font-size: 12.5px; line-height: 1.45;
+    padding: 8px 12px; border-radius: 999px;
+    backdrop-filter: blur(16px) saturate(1.2); -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    opacity: 0; pointer-events: none;
+    transition: opacity .3s cubic-bezier(.22,1,.36,1), transform .3s cubic-bezier(.22,1,.36,1);
+    z-index: 11; max-width: min(560px, calc(100vw - 40px));
+    display: flex; flex-direction: row; gap: 10px; align-items: center; justify-content: flex-start;
+    text-align: left;
+  }
+  .mic-banner.show { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+  .mic-icon { flex: none; width: 22px; height: 22px; color: var(--accent); }
+  .mic-title { display: none; }
+  .mic-text { min-width: 0; }
+  .mic-banner button {
+    flex: none; display: inline-flex; align-items: center; gap: 6px;
+    background: linear-gradient(180deg, rgba(249,115,22,0.92), rgba(220,92,12,0.92));
+    border: 1px solid rgba(255,190,130,0.35);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.25) inset, 0 2px 6px rgba(0,0,0,0.3);
+    color: #fff; border-radius: 999px;
+    font-size: 12px; font-weight: 600;
+    padding: 5px 12px; cursor: pointer;
+    transition: filter .15s, transform .1s;
+  }
+  .mic-banner button svg { width: 12px; height: 12px; }
+  .mic-banner button:hover { filter: brightness(1.12); }
+  .mic-banner button:active { transform: scale(0.97); }
+  .mic-banner button:focus-visible { outline: 2px solid rgba(255,190,130,0.6); outline-offset: 2px; }
+  @media (max-width: 480px) {
+    .mic-banner { white-space: normal; }
+    .mic-title { display: block; font-weight: 650; color: #ffdfc2; margin: 0 0 2px; }
+  }
+
+  /* ---------- main column ---------- */
+  main {
+    flex: 1 1 auto;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 0;
+    padding: 0 20px 12px;
+  }
+
+  /* ---------- planet zone (slides up when talking) ---------- */
+  .orb-zone {
+    flex: 0 0 auto;
+    display: flex; flex-direction: column; align-items: center;
+    transition: transform .65s cubic-bezier(.22,.75,.25,1);
+    will-change: transform;
+  }
+  /* idle: the orb rests at the vertical center of the stage.
+     Tapping to talk removes body.idle and the zone slides back up. */
+  body.idle:not(.risen) .orb-zone {
+    /* dvh tracks iOS's collapsing URL bar; the vh line is the fallback */
+    transform: translateY(calc((100vh - min(52vmin, 340px) - 32px) / 2));
+    transform: translateY(calc((100dvh - min(52vmin, 340px) - 32px) / 2));
+  }
+
+  /* ---------- planet ---------- */
+  .orb-wrap {
+    position: relative;
+    width: min(52vmin, 340px); height: min(52vmin, 340px);
+    flex: 0 0 auto;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas.wave {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+  }
+  .orb-wrap { transition: transform .5s cubic-bezier(.2,.7,.2,1); }
+  .orb-wrap:hover { transform: scale(1.012); }
+  /* focus ring for keyboard users (the orb is role="button", tabindex="0") */
+  .orb-wrap:focus-visible {
+    outline: 2px solid rgba(255, 170, 100, 0.55);
+    outline-offset: 8px;
+    border-radius: 50%;
+  }
+
+  .state-label {
+    margin-top: 18px;
+    font-size: 12px; font-weight: 600;
+    letter-spacing: 0.26em; text-transform: uppercase;
+    color: rgba(240, 200, 170, 0.55);
+    transition: opacity .5s;
+    flex: 0 0 auto;
+    height: 16px;  /* fixed slot sized to the font so nothing clips */
+    text-align: center;
+  }
+  .state-label.hide { opacity: 0; }
+
+  /* ---------- chat ---------- */
+  .chat {
+    flex: 1 1 auto;
+    width: 100%; max-width: 640px;
+    overflow-y: auto;
+    padding: 20px 6px 10px;
+    display: flex; flex-direction: column; gap: 10px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,190,150,0.18) transparent;
+    min-height: 60px;
+  }
+  .chat::-webkit-scrollbar { width: 6px; }
+  .chat::-webkit-scrollbar-thumb { background: rgba(255,190,150,0.18); border-radius: 3px; }
+
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 82%;
+    padding: 10px 15px;
+    border-radius: 18px;
+    font-size: 14.5px;
+    line-height: 1.5;
+    word-wrap: break-word;
+    animation: pop .28s cubic-bezier(.2,.7,.3,1);
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+  .row.user .bubble {
+    background: rgba(255, 214, 178, 0.09);
+    border: 1px solid rgba(255, 190, 140, 0.16);
+    border-bottom-right-radius: 5px;
+    color: #f7ede4;
+  }
+  .row.bot { align-items: flex-end; }
+  .row.bot .bubble {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-bottom-left-radius: 5px;
+  }
+
+  /* ---------- command notifications (toasts) ----------
+     Transient banners for tool runs and server notices. The server sends
+     tool_start (while the tool runs) then tool_done (final); we render one
+     toast per key, flip it in place, and auto-dismiss. The rail and glyph
+     carry the STATUS — warm while running, green done, red failed. Category
+     hues would be a rainbow for its own sake: live traffic is only
+     tool/system/timer/tray, and the title already says what ran. Anchored
+     top-right, just below the Tools tray: clear of the centered orb, the
+     top banners, and the left wordmark. A leaving toast collapses its box
+     so the stack reflows instead of jumping. */
+  .toast-host {
+    /* below the tray (z 5): with the panel open, transient toasts tuck
+       behind it instead of blocking its chips; they reappear on fold.
+       The mic/sound banners (z 10+) still sit above — they're alerts. */
+    position: fixed; top: 72px; right: 24px; z-index: 3;
+    display: flex; flex-direction: column; align-items: flex-end;
+    pointer-events: none;
+    max-width: min(320px, calc(100vw - 24px));
+  }
+  .toast {
+    --rail: var(--dim);
+    position: relative;
+    display: flex; align-items: flex-start; gap: 9px;
+    width: min(300px, calc(100vw - 24px));
+    padding: 10px 12px 10px 13px;
+    background: rgba(17, 12, 9, 0.86);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--rail);
+    border-radius: 12px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+    pointer-events: auto;
+    cursor: pointer;
+    overflow: hidden;
+    opacity: 0; transform: translateX(14px);
+    transition: opacity .22s ease, transform .22s cubic-bezier(.2, .7, .3, 1),
+                border-left-color .25s ease,
+                height .2s ease, margin-top .2s ease,
+                padding-top .2s ease, padding-bottom .2s ease,
+                border-top-width .2s ease, border-bottom-width .2s ease;
+  }
+  .toast + .toast { margin-top: 8px; }
+  .toast.in { opacity: 1; transform: none; }
+  .toast.out { opacity: 0; transform: translateX(14px); }
+  /* status rails: the only colours a toast wears */
+  .toast.is-spin { --rail: var(--accent); }
+  .toast.is-ok   { --rail: var(--ok); }
+  .toast.is-err  { --rail: #f87171; }
+  /* the offline nudge is a notice, not a success — keep it warm */
+  .cat-tray.is-ok { --rail: var(--accent); }
+  .cat-tray.is-ok .toast-icon { color: var(--accent); }
+  /* status icon: spinner (running) / check (ok) / x (error) */
+  .toast-icon {
+    flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--rail);
+    transition: color .25s ease;
+  }
+  .toast.is-spin .toast-icon::before {
+    content: ""; width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.14); border-top-color: var(--rail);
+    animation: toastspin .7s linear infinite;
+  }
+  @keyframes toastspin { to { transform: rotate(360deg); } }
+  .toast-icon svg { display: block; }
+  .toast-body { flex: 1 1 auto; min-width: 0; }
+  .toast-title {
+    font-size: 13px; font-weight: 600; line-height: 1.35; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .toast-sub {
+    font-size: 11.5px; font-weight: 400; line-height: 1.45; color: var(--dim);
+    margin-top: 2px; white-space: normal; overflow-wrap: anywhere;
+    max-height: 96px; overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 190, 150, 0.18) transparent;
+  }
+  .toast.is-err .toast-sub { color: #fca5a5; }
+  /* dismiss affordance, revealed on hover only */
+  .toast-x {
+    flex: 0 0 auto; color: var(--dim);
+    opacity: 0; transition: opacity .15s ease; padding: 2px 0 0 1px;
+  }
+  .toast:hover .toast-x { opacity: .85; }
+  @media (max-width: 480px) {
+    .toast-host { top: 56px; bottom: auto; right: 14px; }
+    .toast { width: calc(100vw - 28px); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .toast, .toast.out { transition: opacity .12s ease; transform: none; }
+    .toast.is-spin .toast-icon::before { animation-duration: 1.2s; }
+  }
+
+  /* let the tray's accordions animate their fold to max-height: none
+     (Chrome 129+; older browsers snap instead — same end state) */
+  html { interpolate-size: allow-keywords; }
+
+  /* ---------- Tools tray (upper right, mirrors the wordmark) ----------
+     Collapsible tray: a compact glass toggle; clicking it unfolds the panel
+     with the roster of connected MCP servers. Panel on the same tokens as
+     the rest of the UI, white-outline glyphs, a faint molten lift on hover.
+     Inside: a key line, then one accordion per server. Bullet rows list the
+     tools (dots in the gutter, names aligned with the server name above);
+     ★ marks the confirm-gated ones, hollow dots the ones Lava won't run. */
+  .mcp-tray {
+    position: fixed;
+    top: 20px; right: 24px;
+    z-index: 5;
+    display: flex; flex-direction: column; align-items: flex-end;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mcp-toggle {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 13px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    color: rgba(242, 233, 226, 0.78);
+    font: inherit;
+    font-size: 12.5px; font-weight: 550; letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: color .2s ease, background .2s ease, border-color .2s ease, box-shadow .2s ease;
+  }
+  .mcp-toggle svg {
+    width: 16px; height: 16px;
+    flex: 0 0 auto;
+    display: block;
+  }
+  /* the toggle's label shares .mcp-name with the roster rows — let it ride
+     the toggle's color instead of the row color */
+  .mcp-toggle .mcp-name { color: inherit; }
+  .mcp-toggle:hover,
+  .mcp-tray.open .mcp-toggle {
+    color: var(--text);
+    background: rgba(255, 190, 150, 0.07);
+    border-color: rgba(255, 190, 150, 0.18);
+    box-shadow: 0 0 12px rgba(249, 115, 22, 0.12);
+  }
+  .mcp-toggle:focus-visible,
+  .mcp-item:focus-visible,
+  .mcp-tool.on:focus-visible {
+    outline: 2px solid rgba(255, 170, 100, 0.55);
+    outline-offset: 2px;
+  }
+  .mcp-chev { transition: transform .2s ease; }
+  .mcp-tray.open .mcp-chev { transform: rotate(180deg); }
+  .mcp-tray-panel {
+    margin-top: 8px;
+    display: flex; flex-direction: column;
+    padding: 10px 6px 8px;
+    width: 296px;  /* fixed: folded tool chips must not inflate the tray */
+    max-width: calc(100vw - 28px);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    /* folded by default; .mcp-tray.open unfolds it */
+    visibility: hidden; opacity: 0; transform: translateY(-4px);
+    transition: opacity .18s ease, transform .18s ease, visibility 0s linear .18s;
+  }
+  .mcp-tray.open .mcp-tray-panel {
+    visibility: visible; opacity: 1; transform: none;
+    transition: opacity .18s ease, transform .18s ease;
+  }
+  /* key line: what the marks in the roster mean */
+  .mcp-legend {
+    flex: 0 0 auto;
+    margin: 0 9px 7px;
+    padding-bottom: 7px;
+    border-bottom: 1px solid rgba(255, 190, 150, 0.08);
+    font-size: 10px; font-weight: 500;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: rgba(154, 141, 132, 0.85);
+  }
+  .mcp-legend .star { color: var(--accent); }
+  /* the roster scrolls as one piece; the key line stays pinned above it.
+     Tall as the stage allows, and the ONLY scroll context in the tray:
+     accordions expand to their natural height in place, so the last row of
+     any roster (github's 113, spotify's 12) always stays reachable. */
+  #mcpGroups {
+    display: flex; flex-direction: column;
+    max-height: calc(100vh - 128px);
+    max-height: calc(100dvh - 128px);  /* dvh tracks the iOS URL bar */
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 190, 150, 0.18) transparent;
+  }
+  #mcpGroups::-webkit-scrollbar { width: 6px; }
+  #mcpGroups::-webkit-scrollbar-thumb { background: rgba(255, 190, 150, 0.18); border-radius: 3px; }
+  /* one server: its row button, plus the chips of tools it exposes below */
+  .mcp-group {
+    display: flex; flex-direction: column;
+    width: 100%;
+  }
+  .mcp-group + .mcp-group { border-top: 1px solid rgba(255, 190, 150, 0.06); }
+  .mcp-item {
+    display: flex; align-items: flex-start; gap: 8px;
+    width: 100%;
+    padding: 7px 9px;
+    border: 0; background: none; font: inherit; text-align: left;
+    border-radius: 9px;
+    white-space: nowrap;
+    color: rgba(242, 233, 226, 0.78);
+    cursor: pointer;
+    transition: color .2s ease, background .2s ease, box-shadow .2s ease;
+  }
+  .mcp-item svg {
+    width: 16px; height: 16px;
+    flex: 0 0 auto;
+    display: block;
+    margin-top: 1px;
+  }
+  /* affordance: tiny arrow that turns to hint the unfold */
+  .mcp-item-chev {
+    width: 12px; height: 12px;
+    flex: 0 0 auto;
+    margin-left: auto; margin-top: 3px;
+    color: rgba(242, 233, 226, 0.3);
+    transition: transform .2s ease, color .2s ease;
+  }
+  .mcp-group.open .mcp-item-chev {
+    transform: rotate(90deg);
+    color: rgba(242, 233, 226, 0.65);
+  }
+  .mcp-body {
+    display: flex; flex-direction: column; gap: 2px;
+    min-width: 0;
+  }
+  .mcp-name {
+    font-size: 12.5px; font-weight: 550;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+    color: rgba(242, 233, 226, 0.9);
+    transition: color .2s ease;
+  }
+  .mcp-meta {
+    font-size: 10.5px; font-weight: 400;
+    letter-spacing: 0.02em;
+    /* wraps instead of spilling over the unfold arrow: the longest metas
+       (github/spotify, with the gated count) don't fit one 296px line */
+    white-space: normal;
+    color: rgba(154, 141, 132, 0.9);  /* keeps 10.5px text at AA contrast */
+  }
+  /* roster empty-state, and per-server live health (mcp_client.HEALTH):
+     green = contacted ok, red = unreachable, dim = never contacted */
+  .mcp-empty {
+    margin: 4px 9px 6px;
+    font-size: 11px;
+    color: rgba(154, 141, 132, 0.9);
+  }
+  .mcp-health {
+    display: inline-block;
+    width: 6px; height: 6px;
+    margin-right: 6px;
+    border-radius: 50%;
+    vertical-align: 1px;
+    background: rgba(154, 141, 132, 0.4);  /* unknown */
+  }
+  .mcp-health.up { background: rgba(52, 211, 153, 0.8); }
+  .mcp-health.down { background: #f87171; }
+  /* the roster of tools each server exposes — folded until its row is clicked.
+     Rendered as a bullet list: dots in the gutter, tool names aligned with
+     the server name above them (39px in). Expands to its natural height —
+     no inner scrollbar; the panel's roster scroller is the only one. */
+  .mcp-tools {
+    padding: 2px 9px 8px 26px;
+    text-align: left;
+    max-height: 0; opacity: 0; overflow: hidden;
+    transition: max-height .22s ease, opacity .18s ease;
+  }
+  .mcp-group.open .mcp-tools {
+    max-height: none;
+    opacity: 1;
+    overflow: visible;
+  }
+  /* hairline between the allowlisted tools and the ones offered but off */
+  .mcp-tools .off-rule {
+    margin: 6px 0;
+    border: 0;
+    border-top: 1px solid rgba(255, 190, 150, 0.07);
+  }
+  .mcp-tool {
+    display: block; position: relative;
+    width: 100%;
+    padding: 0 0 0 7px;  /* tool names align with the server name (39px) */
+    border: 0; background: none; font: inherit;
+    font-size: 11.5px; line-height: 2.0; letter-spacing: 0.02em;
+    text-align: left; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+    color: rgba(242, 233, 226, 0.55);
+    cursor: pointer;
+    transition: color .15s ease;
+  }
+  .mcp-tool::before {
+    content: "·" / "";  /* alt "" — decorative, silent to screen readers */
+    position: absolute; left: 0; top: 0;
+    line-height: 2.05;
+    color: rgba(242, 233, 226, 0.3);
+    transition: color .15s ease;
+  }
+  .mcp-tool:hover { color: var(--text); }
+  .mcp-tool:hover::before { color: rgba(255, 170, 100, 0.9); }
+  /* ★ rides after gated names — Lava confirms before running these */
+  .mcp-tool .gate {
+    margin-left: 5px;
+    font-size: 9px;
+    color: var(--accent);
+  }
+  /* offered but not callable: hollow dot, tighter and quieter, no affordance
+     beyond the title tooltip that says why */
+  .mcp-tool.off {
+    font-size: 10.5px; line-height: 1.9;
+    color: rgba(154, 141, 132, 0.65);  /* >= 3:1 on the panel; was unreadable */
+    cursor: default;
+  }
+  .mcp-tool.off::before {
+    content: "○" / "";  /* alt "" — decorative, silent to screen readers */
+    font-size: 8px; line-height: 2.45;
+    color: rgba(154, 141, 132, 0.4);
+  }
+  .mcp-tool.off:hover { color: rgba(154, 141, 132, 0.75); }
+  .mcp-tool.off:hover::before { color: rgba(154, 141, 132, 0.55); }
+  .mcp-item:hover {
+    color: var(--text);
+    background: rgba(255, 190, 150, 0.07);
+    box-shadow: 0 0 12px rgba(249, 115, 22, 0.12);
+  }
+  .mcp-item:hover .mcp-name { color: var(--text); }
+  /* tight on phones: tuck the tray into the corner */
+  @media (max-width: 640px) {
+    .mcp-tray { top: 14px; right: 14px; }
+    .mcp-toggle { padding: 6px 9px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .mcp-tray-panel, .mcp-tray.open .mcp-tray-panel, .mcp-chev,
+    .mcp-tools, .mcp-item-chev { transition: none; }
+  }
+
+  /* Screen-reader-only: visually hidden but announced by assistive tech.
+     Used for chat speaker labels ("You said:" / "Lava:") — the transcript
+     rows are distinguished only visually, which a screen reader can't see. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+

@@ -1,0 +1,85 @@
+# Tools exposed by the 'spotify' MCP server (15 found).
+# Flip `enabled` to choose what the LLM sees; `confirm = true` requires spoken
+# user approval before the gateway runs the tool (see tool_gateway.py).
+# Playback controls stay exempt: the user just asked for them out loud.
+# Read directly at startup.
+
+[server]
+name = "spotify"
+
+[[tool]]
+name = "spotify_add_tracks"
+description = "Add tracks (by URI, e.g. spotify:track:...) to a playlist. Up to 100 per call."
+enabled = true
+confirm = true
+
+[[tool]]
+name = "spotify_create_playlist"
+description = "Create a new playlist in the connected Spotify account and return its ID."
+enabled = true
+confirm = true
+
+[[tool]]
+name = "spotify_get_devices"
+description = "List the user's Spotify devices."
+enabled = true
+
+[[tool]]
+name = "spotify_get_playlists"
+description = "List the playlists in the connected Spotify account."
+enabled = false
+
+[[tool]]
+name = "spotify_now_playing"
+description = "Get the track currently playing (or most recently played)."
+enabled = false
+
+[[tool]]
+name = "spotify_pause"
+description = "Pause playback. Spotify Premium required."
+enabled = true
+
+[[tool]]
+name = "spotify_play"
+description = "Start playback. Track lists go in track_uris (e.g. [\"spotify:track:…\"]); context_uri is only for albums or playlists. Devices are selected automatically (web player preferred) — never ask the user to choose one; if playback still fails, say so plainly."
+enabled = true
+
+[[tool]]
+name = "spotify_queue"
+description = "Add a track to the playback queue. Needs Spotify Premium and an active device, like spotify_play — the same error map applies. If it fails repeatedly, tell the user the account cannot be controlled remotely and stop retrying."
+enabled = false
+
+[[tool]]
+name = "spotify_search"
+description = "Search Spotify for tracks, artists, albums, or playlists. Use track URIs from results with other tools."
+enabled = true
+
+[[tool]]
+name = "spotify_skip"
+description = "Skip to the next track. Devices are selected automatically; if it still fails, say so plainly instead of retrying."
+enabled = true
+
+[[tool]]
+name = "spotify_status"
+description = "Check whether a Spotify account is connected and which tools are available."
+enabled = false
+
+[[tool]]
+name = "spotify_volume"
+description = "Get the current playback volume (0-100), or set it to an exact level. Spotify Premium required to set."
+enabled = false
+
+[[tool]]
+name = "spotify_volume_down"
+description = "Turn the volume down by a step (default 10), clamped at 0. With no active playback the level is unknown — use spotify_volume with an exact level instead."
+enabled = true
+
+[[tool]]
+name = "spotify_volume_up"
+description = "Turn the volume up by a step (default 10), clamped at 100. With no active playback the level is unknown — use spotify_volume with an exact level instead."
+enabled = true
+
+[[tool]]
+name = "whoami"
+description = "Return the signed-in user of this MCP server."
+enabled = false

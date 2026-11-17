@@ -1,0 +1,29 @@
+# secrets — never commit
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# runtime artifacts
+tmp/
+logs/
+*.wav
+data/memory.db
+
+# piper voices are ~60 MB each; fetch with:
+#   python3 -m piper.download_voices en_US-hfc_female-medium
+voices/*.onnx
+voices/*.onnx.json
+
+# personal — never publish
+data/
+myfiles/
+
+# os noise
+.DS_Store
+
+.pytest_cache/
+.dev.vars

@@ -1,0 +1,18 @@
+# Tools exposed by the 'asr' MCP server (2 tools).
+# Voice-loop bridge: transcribe drives ASR directly and is excluded from the
+# LLM tool schema (pipeline.py BRIDGE_SERVERS) — `enabled` lets the bridge
+# call it, not the model.
+# Flip `enabled` to choose what the LLM sees; read directly at startup.
+
+[server]
+name = "asr"
+
+[[tool]]
+name = "enroll"
+description = "Add a speech segment to the owner's voiceprint. For agent/enroll_voice.py only — the LLM cannot supply audio."
+enabled = false
+
+[[tool]]
+name = "transcribe"
+description = "Transcribe Base64 audio using Groq Whisper — owner's voice only; other speakers return ''."
+enabled = true

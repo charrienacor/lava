@@ -1,0 +1,28 @@
+# lava — voice agent requirements (Python 3.13, RPi 4 compatible)
+# install with: uv pip install -r requirements.txt
+
+# agent harness (pipecat 1.16 APIs are used by agent/pipeline.py)
+pipecat-ai[mcp,silero,groq]==1.16.0
+# pipecat MCPClient requires MCP SDK 2.x (2.1.1+); mcp/mcp_servers use the 2.x API
+mcp>=2.1.1
+
+# MCP servers (built by us, run on the RPi)
+groq==1.7.0          # mcp/asr_server.py: Whisper large-v3
+piper-tts==1.8.0     # mcp/tts_server.py: Piper en_US-hfc_female-medium
+
+# acoustic front-end: RNNoise noise/music suppression (agent/pipeline.py filter)
+pyrnnoise
+# speaker gate: owner-verified ASR (mcp/asr_server.py voiceprint enrollment).
+# brings torch (the embedding encoder) and webrtcvad; pkg_resources needs
+# setuptools<81 on Python 3.13.
+resemblyzer
+setuptools<81
+# mic recording for enrollment (agent/record_voice.py); macOS wheel bundles
+# PortAudio, on the RPi install it first: sudo apt install libportaudio2
+sounddevice
+
+# pipecat dev runner (voice web client transport)
+fastapi
+aiohttp
+python-dotenv
+pyyaml              # agent/prompt.py: data/profile.yaml personalization

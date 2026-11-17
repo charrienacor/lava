@@ -1,0 +1,13 @@
+# Tools exposed by the 'tts' MCP server (1 tool).
+# Voice-loop bridge: speak drives TTS directly and is excluded from the LLM
+# tool schema (pipeline.py BRIDGE_SERVERS) — `enabled` lets the bridge call
+# it, not the model.
+# Flip `enabled` to choose what the LLM sees; read directly at startup.
+
+[server]
+name = "tts"
+
+[[tool]]
+name = "speak"
+description = "Convert text to Base64 WAV audio."
+enabled = true

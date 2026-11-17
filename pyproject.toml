@@ -1,0 +1,34 @@
+[project]
+name = "lava"
+version = "1.0.0"
+description = "Lava — full-duplex voice agent (Pipecat + MCP) for Raspberry Pi 4"
+requires-python = ">=3.11"
+dependencies = [
+    # agent harness (pipecat 1.16 APIs are used by agent/pipeline.py)
+    "pipecat-ai[mcp,silero,groq]==1.16.0",
+    # pipecat MCPClient requires MCP SDK 2.x (2.1.1+); mcp/ servers use the 2.x API
+    "mcp>=2.1.1",
+    # MCP servers (built by us, run on the Pi)
+    "groq==1.7.0",           # mcp/asr_server.py: Whisper large-v3
+    "piper-tts==1.8.0",      # mcp/tts_server.py: Piper en_US-hfc_female-medium
+    # acoustic front-end: RNNoise noise/music suppression (agent/pipeline.py)
+    "pyrnnoise",
+    # speaker gate: owner-verified ASR (mcp/asr_server.py voiceprint enrollment)
+    "resemblyzer",
+    "setuptools<81",         # pkg_resources on Python 3.13
+    # mic recording for enrollment (agent/record_voice.py); RPi needs
+    # libportaudio2 (sudo apt install libportaudio2) before this wheel
+    "sounddevice",
+    # pipecat dev runner (voice web client transport) + env/config
+    "fastapi",
+    "aiohttp",
+    "python-dotenv",
+    "pyyaml",                # agent/prompt.py: data/profile.yaml personalization
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["agent/tests"]
+addopts = "-q"

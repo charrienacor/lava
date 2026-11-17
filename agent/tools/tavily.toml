@@ -1,0 +1,30 @@
+# Tools exposed by the 'tavily' MCP server (5 found).
+# Flip `enabled` to choose what the LLM sees; read directly at startup.
+
+[server]
+name = "tavily"
+
+[[tool]]
+name = "tavily_extract"
+description = "Extract content from URLs. Returns raw page content in markdown or text format. Use it to read a page in full or to confirm a fact found in search results. Pages that could not be read are listed in failed_results; retry a timeout once, then try another source."
+enabled = true
+
+[[tool]]
+name = "tavily_search"
+description = "Search the web for current information on any topic. Use for news, facts, or data beyond your knowledge cutoff, and before answering any question about specific facts, figures or recent events. Returns up to 5 curated snippets with source URLs, tuned for speed; prefer ONE focused query over several broad ones — searching again is another few seconds the user waits. Read a page in full with tavily_extract to confirm what it says."
+enabled = true
+
+[[tool]]
+name = "tavily_crawl"
+description = "Crawl a website starting from a URL. Extracts content from pages with configurable depth and breadth."
+enabled = false
+
+[[tool]]
+name = "tavily_map"
+description = "Map a website's structure. Returns a list of URLs found starting from the base URL."
+enabled = false
+
+[[tool]]
+name = "tavily_research"
+description = "Perform comprehensive research on a given topic or question. Use this tool when you need to gather information from multiple sources, including web pages, documents, and other resources, to answer a question or complete a task. Returns a detailed response based on the research findings. Rate limit: 20 requests per minute."
+enabled = false
