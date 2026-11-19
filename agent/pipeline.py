@@ -149,8 +149,11 @@ async def run_bot(
 
     # --- Services ----------------------------------------------------------
     # The system prompt rides on the service (system_instruction), not in
-    # the context — see llm.py.
-    llm = create_llm(system_instruction=prompt.SYSTEM_PROMPT)
+    # the context — see llm.py. system_prompt() (not the SYSTEM_PROMPT
+    # snapshot) keeps the "Current date" line honest for long-running
+    # servers; a wrong internal year is what sent tavily_search after
+    # 2024 results for a 2026 question (see prompt.py).
+    llm = create_llm(system_instruction=prompt.system_prompt())
 
     # --- Progressive disclosure: heavy servers behind one generic tool -----
     # A fresh ToolsSchema per session: the shared base schemas plus NEW

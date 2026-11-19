@@ -31,3 +31,18 @@ def test_profile_renders(monkeypatch, tmp_path):
 
 def test_untrusted_data_rule_present():
     assert "untrusted data" in prompt.SYSTEM_PROMPT
+
+
+def test_current_date_is_injected():
+    text = prompt._system_prompt(today="Thursday, 19 November 2026")
+    assert "Thursday, 19 November 2026" in text
+    # the search-first rule rides with the date: without it the model
+    # searched "results 2024" for a 2026 question
+    assert "tavily_search" in text
+
+
+def test_system_prompt_date_is_fresh():
+    import datetime
+
+    today = datetime.datetime.now().strftime("%A, %d %B %Y")
+    assert today in prompt.system_prompt()

@@ -1,5 +1,6 @@
 """Versioned system prompts — personalized from data/profile.yaml."""
 
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -10,6 +11,17 @@ PROFILE_YAML = Path(__file__).resolve().parents[1] / "data" / "profile.yaml"
 _IDENTITY = """\
 You are Lava, a voice agent that listens and speaks at the same time, running
 locally on a Raspberry Pi 4.
+"""
+
+# Without an explicit date the model answers current-events questions from
+# its pre-2026 training memory ("the midterms haven't happened yet") and
+# never reaches for search — even when the user names the year. The date is
+# computed at prompt build time (see system_prompt()) and paired with a hard
+# search-first rule, since the tool description alone was not enough.
+_AWARENESS_TEMPLATE = """\
+Current date: {today}. Your training data predates that — search
+(tavily_search) before answering anything current. Never answer from memory
+or claim something "hasn't happened yet" without searching.
 """
 
 _STYLE = """\
@@ -86,10 +98,25 @@ def _profile_section(path: Path | None = None) -> str:
     return "About the user:\n- " + "\n- ".join(lines) + "\n" if lines else ""
 
 
-def _system_prompt() -> str:
+def _system_prompt(today: str | None = None) -> str:
+    today = today or datetime.now().strftime("%A, %d %B %Y")
     section = _profile_section()
-    blocks = [_IDENTITY, section, _STYLE] if section else [_IDENTITY, _STYLE]
+    awareness = _AWARENESS_TEMPLATE.format(today=today)
+    blocks = [_IDENTITY, awareness, section, _STYLE] if section else [_IDENTITY, awareness, _STYLE]
     return "\n".join(blocks)
 
 
-SYSTEM_PROMPT = _system_prompt()
+def system_prompt() -> str:
+    """The system prompt with the date computed NOW, not at import.
+
+    Sessions call this when they build their LLM service, so a server that
+    stays up for days still tells the model the right date. A stale date is
+    not cosmetic: the model writes the search query, and a wrong internal
+    year sends tavily_search after the wrong election (observed in logs:
+    'results 2024' for a 2026 question). SYSTEM_PROMPT (import-time
+    snapshot) stays for tests and one-off consumers.
+    """
+    return _system_prompt()
+
+
+SYSTEM_PROMPT = system_prompt()
