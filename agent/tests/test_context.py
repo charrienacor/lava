@@ -32,7 +32,7 @@ def test_create_context_wires_the_summarize_handler(monkeypatch):
     monkeypatch.setattr(context_mod, "LAST_SUMMARY", None)
     monkeypatch.setenv("SMART_TURN", "0")  # timers: no ONNX model in tests
 
-    llm_context, _, assistant = context_mod.create_context(tools=ToolsSchema())
+    llm_context, _, assistant = context_mod.create_context(tools=ToolsSchema(standard_tools=[]))
 
     summarizer = getattr(assistant, "_summarizer", None)
     assert summarizer is not None, "pipecat 1.16 always builds the summarizer"

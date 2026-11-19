@@ -13,16 +13,20 @@ piper-tts==1.8.0     # mcp/tts_server.py: Piper en_US-hfc_female-medium
 # acoustic front-end: RNNoise noise/music suppression (agent/pipeline.py filter)
 pyrnnoise
 # speaker gate: owner-verified ASR (mcp/asr_server.py voiceprint enrollment).
-# brings torch (the embedding encoder) and webrtcvad; pkg_resources needs
-# setuptools<81 on Python 3.13.
-resemblyzer
-setuptools<81
+# the encoder is ONNX (models/voice_encoder.onnx — exported once on the dev
+# machine by tools/export_voice_encoder.py): no torch/librosa/scipy on the RPi.
+onnxruntime           # the gate's embedding runtime (pipecat base-dep, kept explicit)
+webrtcvad             # silence trimming before embedding (C ext, compiles on the RPi)
+setuptools<81         # webrtcvad imports pkg_resources, removed in setuptools 81
 # mic recording for enrollment (agent/record_voice.py); macOS wheel bundles
 # PortAudio, on the RPi install it first: sudo apt install libportaudio2
 sounddevice
 
 # pipecat dev runner (voice web client transport)
+# fd-benchmark machine-resources stats (CPU/RAM during benchmark runs)
+psutil>=5.9
 fastapi
+uvicorn               # ui/server.py's server; the mcp SDK also pulls it in
 aiohttp
 python-dotenv
 pyyaml              # agent/prompt.py: data/profile.yaml personalization

@@ -10,17 +10,33 @@ as an error message the model can correct on its next turn.
 
 Confirm gate: TOML tools marked ``confirm = true`` cannot run from a single
 call. The first call is refused with CONFIRMATION_REQUIRED (the model must ask
-the user out loud); the re-call must carry ``confirmed = true`` AND the newest
-user MESSAGE must have changed since the request, so the model cannot confirm
-on the user's behalf. The message — not a turn count — is the anchor: the
-auto-summarizer compresses old turns mid-conversation, and a count recorded
-before a summarize could never be surpassed again (measured: four spoken
-approvals, every one bounced with CONFIRMATION_STILL_PENDING). Once an
-approval lands, the TARGET (repo/PR/file/playlist/tracks — see
+the user out loud); the re-call must carry ``confirmed = true`` AND the user
+must have spoken since the ask, so the model cannot confirm on the user's
+behalf. "Has the user spoken" is detected by EITHER the newest user message
+text changing OR the user-turn count growing. Text alone fails when the user
+repeats the same word ("Yes." twice); the count alone fails when the
+auto-summarizer compresses old turns (the count shrinks and a count recorded
+before a summarize could never be surpassed again). Using both covers each
+other's blind spot.
+
+Once an approval lands, the TARGET (repo/PR/file/playlist/tracks — see
 _IDENTITY_KEYS) is granted for the rest of the session: same-target repeats
 (iterating on the just-approved page) skip the handshake entirely, while a
-different target is a new fingerprint and asks again. Actions without an
-identity mapping fall back to full arguments.
+different target is a new fingerprint and asks again. Fingerprints are
+NORMALIZED (stringified, sorted lists, `confirmed` stripped) so cosmetic drift
+between the ask and the re-call does not look like a new target. Actions
+without an identity mapping fall back to full (normalized) arguments.
+
+Loop prevention (what was measured and what fixes it):
+
+  * Cap only limits NEW asks. A legitimate confirmed re-call after the user
+    answered is never blocked by the ask budget.
+  * A call made while an ask is still unanswered does NOT burn budget; it is
+    answered with CONFIRMATION_STILL_PENDING.
+  * Arguments are validated against the captured schema BEFORE the gate, so
+    the user is never asked to approve a call that was going to fail
+    (ask-confirm-fail-fix-ask-again).
+  * A ``confirmed`` flag nested inside ``arguments`` is honored.
 
 Patience (mechanical, from conversation-design practice): Google's Dialogflow
 ends a dialog after 3 no-input/no-match attempts, and ServiceNow's guide caps
@@ -36,11 +52,12 @@ Design: the guards are data; the gateway is the only stateful piece.
     policy source     the TOMLs, re-read on every call (live policy)
     policy tables     identity keys, patience caps
     per-session state SessionState + _Call (fresh per session)
-    guards            deny / confirm gate / strikeout / breaker — one concern each
+    guards            deny / validate / strikeout / breaker / confirm gate
     ServerGateway     owns client + state; handle() = guards → call → frame
     gateway_schemas   entry point: register one gateway per wrapped server
 """
 
+import asyncio
 import json
 import re
 import tomllib
@@ -60,6 +77,10 @@ from mcp_client import (
 )
 
 TOOL_DIR = Path(__file__).resolve().parent / "tools"
+
+# Session start waits at most this long for missing tool schemas to heal.
+SCHEMA_HEAL_TIMEOUT_SECS = 3.0
+_BACKGROUND: set[asyncio.Future] = set()  # late captures: keep a reference
 
 
 # ---- Policy source: agent/tools/<server>.toml, re-read live ---------------
@@ -176,7 +197,8 @@ def _schema(server: str, catalogue: list[tuple[str, str, bool]]) -> FunctionSche
             "type": "boolean",
             "description": (
                 "Set true ONLY to re-run an action after the user approved "
-                "it following a CONFIRMATION_REQUIRED result."
+                "it following a CONFIRMATION_REQUIRED result. This is a "
+                "top-level field, NOT part of `arguments`."
             ),
         },
     }
@@ -211,22 +233,37 @@ def _user_turn_count(params) -> int:
 def _last_user_text(params) -> str:
     """The newest user message's text ("" when none).
 
-    This is the confirm gate's "has the user spoken since the ask?" anchor.
-    A turn COUNT breaks under auto-summarization: the summarizer replaces
-    old user turns with one summary message, the count shrinks, and an
-    approval recorded before the summarize can never be surpassed again
+    One half of the confirm gate's "has the user spoken since the ask?"
+    anchor (the other half is the user-turn count, see _user_anchor).
+
+    A turn COUNT alone breaks under auto-summarization: the summarizer
+    replaces old user turns with one summary message, the count shrinks, and
+    an approval recorded before the summarize can never be surpassed again
     (measured: four spoken approvals — "Push it!", "Yes.", "Go ahead.",
-    "Yes." — every one bounced with CONFIRMATION_STILL_PENDING). The
-    newest user MESSAGE survives summarization (summarization keeps the
-    recent turns), so comparing it before/after is order-safe. Barge-in
-    notes use role "developer", so an unheard interruption never counts
-    as an answer.
+    "Yes." — every one bounced with CONFIRMATION_STILL_PENDING). The newest
+    user MESSAGE survives summarization (summarization keeps the recent
+    turns), so comparing it before/after is order-safe. Text alone breaks
+    when the user repeats the identical words, which is why the count is
+    checked too. Barge-in notes use role "developer", so an unheard
+    interruption never counts as an answer.
     """
     messages = getattr(params.context, "messages", None) or []
     for m in reversed(messages):
         if isinstance(m, dict) and str(m.get("role", "")).lower() == "user":
             return str(m.get("content", ""))
     return ""
+
+
+def _user_anchor(params) -> tuple[str, int]:
+    """(newest user text, user-turn count): the 'has the user spoken' anchor."""
+    return _last_user_text(params), _user_turn_count(params)
+
+
+def _truthy(value: Any) -> bool:
+    """Lenient bool: models sometimes send "true" as a string."""
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
 
 
 # ---- Protected-action policy: identity binding, patience -------------------
@@ -255,20 +292,42 @@ MAX_ASKS_PER_TARGET = 2  # approval rounds per target before terminal refusal
 MAX_ACTION_FAILS = 3  # failed calls per action per session before terminal
 
 
+def _norm(value: Any) -> Any:
+    """Normalize one argument value so cosmetic drift is not a new target.
+
+    12 vs "12" compare equal; lists compare order-insensitively; dicts
+    compare key-order-insensitively; absent/None stays None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return sorted(str(x) for x in value)
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, default=str)
+    return str(value)
+
+
 def _identity(server: str, action: str, args: dict[str, Any]) -> str:
-    """Fingerprint of a protected call: action + its target, nothing more."""
+    """Fingerprint of a protected call: action + its target, nothing more.
+
+    Always includes every identity key (None when absent), so omitting an
+    optional key on the retry does not change the fingerprint. `confirmed`
+    is stripped defensively so it can never leak into the identity.
+    """
+    args = {k: v for k, v in args.items() if k != "confirmed"}
     keys = _IDENTITY_KEYS.get(server, {}).get(action)
-    if keys is None:  # unmapped gated action: stay strict
-        identity = args
+    if keys is None:  # unmapped gated action: stay strict, but normalized
+        identity = dict(args)
     else:
-        identity = {k: args.get(k) for k in keys if k in args}
-        if server == "github" and action == "push_files":
-            # The affected file paths are target, not payload.
-            files = args.get("files")
-            if isinstance(files, list):
-                identity["files"] = sorted(
-                    f.get("path", "?") for f in files if isinstance(f, dict)
-                )
+        identity = {k: args.get(k) for k in keys}
+    identity = {k: _norm(v) for k, v in identity.items()}
+    if server == "github" and action == "push_files":
+        # The affected file paths are target, not payload.
+        files = args.get("files")
+        if isinstance(files, list):
+            identity["files"] = sorted(
+                str(f.get("path", "?")) for f in files if isinstance(f, dict)
+            )
     return action + ":" + json.dumps(identity, sort_keys=True, default=str)
 
 
@@ -289,8 +348,8 @@ class SessionState:
     them — clear rather than grow.
     """
 
-    pending: dict[str, str] = field(default_factory=dict)
-    # fingerprint -> newest user message text at ask time
+    pending: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # fingerprint -> (newest user text, user-turn count) at ask time
     granted: set[str] = field(default_factory=set)
     # fingerprints approved this session: same-target repeats skip the
     # handshake entirely (iterating on a just-approved page/playlist is
@@ -354,89 +413,124 @@ def _deny_unallowed(
     )
 
 
+def _validate_args(
+    gw: "ServerGateway", params, call: _Call
+) -> str | None:
+    """Reject calls missing required arguments BEFORE the confirm gate.
+
+    Without this, the gate asks the user to approve a call that the MCP
+    server then rejects for bad arguments; the model fixes them, the call
+    is re-gated, and the user is asked again (ask-confirm-fail-ask-again).
+    Validating first means approvals are only ever requested for calls that
+    can actually run. No schema captured for the action → nothing to check.
+    """
+    info = (SERVER_TOOL_SCHEMAS.get(gw.server) or {}).get(call.action)
+    if not info:
+        return None
+    required = list(info.get("required") or [])
+    missing = [
+        p for p in required
+        if p not in call.call_args or call.call_args[p] in (None, "")
+    ]
+    if not missing:
+        return None
+    return (
+        f"Error: '{call.action}' is missing required argument(s): "
+        f"{', '.join(missing)}. Pass them inside `arguments` using these "
+        f"exact names, then retry. Do not ask the user for approval yet."
+    )
+
+
 def _confirm_gate(
     gw: "ServerGateway", params, call: _Call
 ) -> str | None:
     """The enforced confirm gate for TOML-flagged actions — None to proceed.
 
-    Order of checks (each returns a denial, or falls through):
-      already granted → patience cap → not confirmed yet → no ask on
-      record → user has not spoken since the ask → pass (approval
-      consumed, target granted for the session).
+    Decision order:
+      1. Not a gated action, or target already granted      → pass.
+      2. Confirmed AND the user has spoken since the ask     → pass
+         (approval consumed, target granted for the session).
+      3. An ask is on record but the user has not spoken     → STILL_PENDING
+         (costs no budget, so same-turn retries cannot exhaust the cap).
+      4. A NEW ask is needed: the patience cap applies HERE only, so it can
+         never block a legitimate confirmed re-call (step 2 runs first).
 
-    The "has the user answered" check anchors on the newest user MESSAGE,
-    not a turn count: the auto-summarizer compresses old turns
-    mid-conversation, and a count recorded before a summarize could never
-    be surpassed again — the gate deadlocked (measured: four spoken
-    approvals for one push_files, every one bounced).
+    "Has the user spoken" = newest user text changed OR user-turn count
+    grew. Text alone misses a repeated "Yes."; count alone deadlocks after
+    the summarizer shrinks old turns. Either signal is enough.
     """
     if call.action not in {n for n, _, c in gw.catalogue if c}:
         return None
-    state = gw.state
+    state, fp = gw.state, call.fingerprint
 
-    # Session grant: this exact target was already approved once. Repeats
+    # 1) Session grant: this target was already approved once. Repeats
     # (wording tweaks, content iterations on the same repo/playlist) ride
     # through silently; a different target is a new fingerprint and asks.
-    if call.fingerprint in state.granted:
+    if fp in state.granted:
         return None
 
-    # Patience cap: after MAX_ASKS_PER_TARGET approval rounds for this
-    # target, refuse terminally. This is what stops the ask-confirm-fail-
-    # ask-again loop (measured 72 CONFIRMATION_REQUIRED and one question
-    # re-asked 29 times). A fresh user turn after the refusal re-opens one
-    # round — the user explicitly asked for another go (anchored on the
-    # newest user message: summarization-proof).
-    spoken_now = _last_user_text(params)
-    blocked_at = state.ask_blocked.get(call.fingerprint)
-    if state.asks.get(call.fingerprint, 0) >= MAX_ASKS_PER_TARGET:
-        if blocked_at is not None and spoken_now != blocked_at:
-            state.asks.pop(call.fingerprint, None)
-            state.ask_blocked.pop(call.fingerprint, None)
+    text, turns = _user_anchor(params)
+    pending = state.pending.get(fp)  # (text, turn count) at ask time
+    answered = pending is not None and (
+        text != pending[0] or turns > pending[1]
+    )
+    confirmed = _truthy(call.arguments.get("confirmed"))
+    logger.debug(
+        f"confirm gate {gw.server}.{call.action} fp={fp} "
+        f"confirmed={confirmed} pending={pending} answered={answered} "
+        f"asks={state.asks.get(fp, 0)} text={text!r} turns={turns}"
+    )
+
+    # 2) Valid approval: consume it and grant the target for the session.
+    if confirmed and answered:
+        state.pending.pop(fp, None)
+        state.granted.add(fp)
+        if len(state.granted) > 64:  # per-session state, keep bounded
+            state.granted.clear()
+            state.granted.add(fp)
+        return None
+
+    # 3) Asked already, user has not replied: do not count, do not re-ask.
+    if pending is not None and not answered:
+        return (
+            "CONFIRMATION_STILL_PENDING: you already asked the user and "
+            "they have not answered yet. Wait for their reply; do not call "
+            "this action again until they have spoken."
+        )
+
+    # 4) A (new) ask is needed. The patience cap applies here only. After
+    # MAX_ASKS_PER_TARGET rounds for this target, refuse terminally. This
+    # stops the ask-confirm-fail-ask-again loop (measured: 72
+    # CONFIRMATION_REQUIRED and one question re-asked 29 times). A fresh
+    # user message after the refusal re-opens one round — the user asked
+    # for another go (anchored on the newest user message: summary-proof).
+    blocked_at = state.ask_blocked.get(fp)
+    if state.asks.get(fp, 0) >= MAX_ASKS_PER_TARGET:
+        if blocked_at is not None and text != blocked_at:
+            state.asks.pop(fp, None)
+            state.ask_blocked.pop(fp, None)
         else:
-            if blocked_at is None:
-                state.ask_blocked[call.fingerprint] = spoken_now
+            state.ask_blocked.setdefault(fp, text)
             return (
-                f"You have already asked the user to approve '{call.action}' "
-                f"{MAX_ASKS_PER_TARGET} times and it still has not gone "
-                f"through. Stop asking and stop calling {gw.server} tools "
-                f"for this. Tell the user plainly that it is not working "
-                f"right now."
+                f"You have already asked the user to approve "
+                f"'{call.action}' {MAX_ASKS_PER_TARGET} times and it still "
+                f"has not gone through. Stop asking and stop calling "
+                f"{gw.server} tools for this. Tell the user plainly that "
+                f"it is not working right now."
             )
-    if not bool(call.arguments.get("confirmed")):
-        state.pending[call.fingerprint] = spoken_now
-        state.asks[call.fingerprint] = state.asks.get(call.fingerprint, 0) + 1
-        if len(state.pending) > 64:  # per-session state, keep bounded
-            state.pending.clear()
-            state.pending[call.fingerprint] = spoken_now
-        return (
-            f"CONFIRMATION_REQUIRED: '{call.action}' is a protected "
-            f"action. Ask the user out loud to approve it "
-            f"(state the key arguments), then call again with the "
-            f"same target plus confirmed=true. Do not set "
-            f"confirmed=true until the user has answered."
-        )
-    asked_text = state.pending.get(call.fingerprint)
-    if asked_text is None:
-        return (
-            f"CONFIRMATION_REQUIRED: the user never approved this "
-            f"target. Ask first; only after they answer, "
-            f"re-call with the same target plus confirmed=true."
-        )
-    if spoken_now == asked_text:
-        return (
-            f"CONFIRMATION_STILL_PENDING: the user has not "
-            f"answered yet. Ask the question and wait for their "
-            f"reply before calling with confirmed=true."
-        )
-    # The approval is consumed and the target is granted for the session:
-    # same-target repeats (content tweaks on the same repo/playlist) no
-    # longer ask; a different target is a new fingerprint and does.
-    state.pending.pop(call.fingerprint)
-    state.granted.add(call.fingerprint)
-    if len(state.granted) > 64:  # per-session state, keep bounded
-        state.granted.clear()
-        state.granted.add(call.fingerprint)
-    return None
+
+    state.pending[fp] = (text, turns)
+    state.asks[fp] = state.asks.get(fp, 0) + 1
+    if len(state.pending) > 64:  # per-session state, keep bounded
+        state.pending.clear()
+        state.pending[fp] = (text, turns)
+    return (
+        f"CONFIRMATION_REQUIRED: '{call.action}' is a protected action. "
+        f"Ask the user ONCE, out loud, to approve it (state the key "
+        f"arguments). When they answer yes, call again with the same "
+        f"target plus confirmed=true as a top-level field. Do not ask "
+        f"again if they have already said yes."
+    )
 
 
 def _strikeout(
@@ -537,6 +631,12 @@ class ServerGateway:
         # reconnect, no new tap.
         self.catalogue = _catalogue(self.server)
         call_args = dict(arguments.get("arguments") or {})
+        # Models sometimes nest `confirmed` inside `arguments`. Honor it as
+        # the top-level flag and strip it so it never reaches the real MCP
+        # call or the fingerprints.
+        if "confirmed" in call_args:
+            if _truthy(call_args.pop("confirmed")):
+                arguments["confirmed"] = True
         return _Call(
             action=action,
             arguments=arguments,
@@ -581,11 +681,20 @@ class ServerGateway:
 # The per-call flow (ServerGateway.handle) is fixed; its rules are data:
 #
 #   GUARDS    run in order before anything executes — the first denial
-#             wins and is spoken unframed.
+#             wins and is spoken unframed. Cheap rejections come first;
+#             the confirm gate runs LAST so the user is only ever asked to
+#             approve a call that is allowed, well-formed, not struck out
+#             and not already known to fail.
 #
 # Adding a rule = adding one function + one entry here.
 
-GUARDS = (_deny_unallowed, _confirm_gate, _strikeout, _circuit_breaker)
+GUARDS = (
+    _deny_unallowed,
+    _strikeout,
+    _circuit_breaker,
+    _validate_args,
+    _confirm_gate,
+)
 
 
 # ---- Entry point: register one gateway per wrapped server ------------------
@@ -607,13 +716,38 @@ async def gateway_schemas(
     startup (spotify worker episodes), the first session after it recovers
     heals the captured schema, and the model gets exact argument names again.
     """
-    schemas = []
+    present = []
     for server in sorted(servers):
-        client = mcp_clients.get(server)
-        if client is None:
+        if mcp_clients.get(server) is None:
             logger.error(f"tool gateway '{server}': no MCP client, skipping")
-            continue
-        await ensure_server_schema(server, client)
+        else:
+            present.append(server)
+    # Heal missing schemas concurrently and on a short leash: this runs on
+    # every session start, and a backend that is still down would otherwise
+    # hold the pipeline boot for its full connect timeout (30 s), once per
+    # down server. A capture that misses the window is not cancelled (that
+    # would abort a connect mid-handshake): it finishes in the background
+    # and the NEXT session gets the exact argument hints.
+    missing = [s for s in present if not SERVER_TOOL_SCHEMAS.get(s)]
+    if missing:
+        tasks = {
+            asyncio.ensure_future(ensure_server_schema(s, mcp_clients[s]))
+            for s in missing
+        }
+        _, late = await asyncio.wait(tasks, timeout=SCHEMA_HEAL_TIMEOUT_SECS)
+        if late:
+            _BACKGROUND.update(late)
+            for task in late:
+                task.add_done_callback(_BACKGROUND.discard)
+            logger.warning(
+                f"tool gateway: schema capture still running after "
+                f"{SCHEMA_HEAL_TIMEOUT_SECS:.0f} s — starting without exact "
+                f"argument hints for the slow server(s)"
+            )
+
+    schemas = []
+    for server in present:
+        client = mcp_clients[server]
         gateway = ServerGateway(server, client)
         # cancel_on_interruption=False: these are side-effectful commands,
         # and remote ones — a spotify or github call can take seconds. With

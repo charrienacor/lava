@@ -71,7 +71,6 @@ from mcp_client import (  # noqa: E402
     connect_mcp_clients_report,
 )
 
-from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter  # noqa: E402
 from pipecat.frames.frames import (  # noqa: E402
     EagerTranscriptionFrame,
     ErrorFrame,
@@ -83,6 +82,7 @@ from pipecat.frames.frames import (  # noqa: E402
     LLMFullResponseEndFrame,
     LLMRunFrame,
     OutputAudioRawFrame,
+    TTSAudioRawFrame,
     TTSTextFrame,
     TranscriptionFrame,
     TTSStartedFrame,
@@ -269,7 +269,7 @@ class Session:
             return
         self.greeted = True
         self.note_greeted()
-        asyncio.create_task(self._send_greeting())
+        _spawn(self._send_greeting())
 
     def recent_greeting(self) -> bool:
         """This client id heard the greeting within the cooldown window."""
@@ -377,6 +377,16 @@ def _action_of(arguments) -> str:
 _TOAST_THROTTLE_SECS = 20.0
 _last_toast_at: dict[str, float] = {}
 
+# asyncio keeps only weak references to tasks: an unreferenced
+# fire-and-forget task can be garbage-collected before it finishes.
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
 
 def broadcast_toast(key: str, title: str, sub: str, cat: str = "system") -> None:
     """Send a toast to every connected session, throttled per key."""
@@ -386,7 +396,7 @@ def broadcast_toast(key: str, title: str, sub: str, cat: str = "system") -> None
     _last_toast_at[key] = now
     payload = {"type": "toast", "key": key, "cat": cat, "title": title, "sub": sub}
     for session in list(SESSIONS.values()):
-        asyncio.create_task(session.send(payload))
+        _spawn(session.send(payload))
 
 
 def _on_groq_rate_limit():
@@ -488,7 +498,12 @@ class LavaTap(FrameProcessor):
     # ---- bot side -------------------------------------------------------
 
     async def _observe_bot(self, frame) -> None:
-        if isinstance(frame, TTSTextFrame):
+        if isinstance(frame, TTSAudioRawFrame):
+            # The turn's TTFA ends at the first reply AUDIO, not at
+            # TTSStartedFrame — that one fires before Piper has produced a
+            # sample, so it hid the whole synthesis time. No-op mid-reply.
+            self._session.turn_first_audio()
+        elif isinstance(frame, TTSTextFrame):
             # The spoken sentence, sequenced with the speech that carries it
             # (the AggregatedTextFrame slot riding alongside it is the
             # context's copy — emitting both would double every bubble).
@@ -508,7 +523,6 @@ class LavaTap(FrameProcessor):
             await self._session.send({"type": "done", "reply": reply, "tools": tools})
         elif isinstance(frame, TTSStartedFrame):
             self._bot_speaking = True
-            self._session.turn_first_audio()  # publish this turn's TTFA
         elif isinstance(frame, TTSStoppedFrame):
             self._bot_speaking = False
         elif isinstance(frame, UserStartedSpeakingFrame):
@@ -763,8 +777,9 @@ async def voice(websocket: WebSocket):
                 audio_out_enabled=True,
                 add_wav_header=False,
                 # Acoustic front-end: music/TV/room noise is suppressed
-                # before the VAD and ASR ever see it.
-                audio_in_filter=RNNoiseFilter(),
+                # before the VAD and ASR ever see it (RNNOISE=0 skips it —
+                # the browser already denoises; see pipeline.input_filter).
+                audio_in_filter=pipeline.input_filter(),
                 serializer=LavaSerializer(session),
                 session_timeout=SESSION_TIMEOUT_SECS,
             ),

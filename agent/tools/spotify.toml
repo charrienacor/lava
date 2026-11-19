@@ -27,7 +27,7 @@ enabled = true
 [[tool]]
 name = "spotify_get_playlists"
 description = "List the playlists in the connected Spotify account."
-enabled = false
+enabled = true
 
 [[tool]]
 name = "spotify_now_playing"

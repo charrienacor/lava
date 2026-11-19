@@ -16,29 +16,40 @@ The voiceprint is labeled with the user's name from data/profile.yaml.
 """
 
 import base64
-import contextlib
 import io
 import json
 import os
 import sys
+import threading
+import time
 import warnings
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.")
 
+import httpx  # noqa: E402
 import numpy as np  # noqa: E402
 from groq import (  # noqa: E402
     APIConnectionError,
     APITimeoutError,
+    DefaultHttpxClient,
     Groq,
     GroqError,
     RateLimitError,
 )
 from loguru import logger  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
-from resemblyzer import VoiceEncoder, preprocess_wav  # noqa: E402
+
+# The gate's encoder is a sibling module: the resemblyzer weights exported to
+# ONNX + numpy preprocessing — no torch on the RPi (see voice_encoder.py).
+# asr_server.py is launched as a script from the project root, so its own
+# folder goes on sys.path to make that import work.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from voice_encoder import OnnxVoiceEncoder  # noqa: E402
 
 mcp = MCPServer("asr")
 # Voice-agent budget: fail fast instead of hanging on a dead connection.
@@ -47,7 +58,18 @@ mcp = MCPServer("asr")
 # ASR_MAX_RETRIES if needed.
 GROQ_TIMEOUT = float(os.environ.get("ASR_TIMEOUT_SECS", "15"))
 GROQ_MAX_RETRIES = int(os.environ.get("ASR_MAX_RETRIES", "3"))
-groq = Groq(timeout=GROQ_TIMEOUT, max_retries=GROQ_MAX_RETRIES)
+# keepalive_expiry=None: httpx's default drops an idle connection after 5 s,
+# and a voice turn is almost always further apart than that — so nearly every
+# utterance paid a fresh TCP + TLS handshake to Groq before its upload began.
+groq = Groq(
+    timeout=GROQ_TIMEOUT,
+    max_retries=GROQ_MAX_RETRIES,
+    http_client=DefaultHttpxClient(
+        limits=httpx.Limits(
+            max_connections=8, max_keepalive_connections=4, keepalive_expiry=None
+        )
+    ),
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 PROFILE_YAML = _ROOT / "data" / "profile.yaml"
@@ -67,20 +89,43 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-large-v3-turbo")
 # sync with agent/asr.py NOT_OWNER.
 _NOT_OWNER = "not-owner"
 
-_encoder: VoiceEncoder | None = None
+# Speculative transcription: the Whisper upload starts at the same time as the
+# speaker-gate embedding instead of after it, so the gate's cost (mel + LSTM —
+# tens to hundreds of ms on a Pi) hides under the network round trip. The
+# price: a rejected segment (another voice, the TV) still reaches Groq and
+# spends free-tier audio seconds; its transcript is discarded. ASR_SPECULATIVE=0
+# restores gate-then-upload.
+SPECULATIVE = os.environ.get("ASR_SPECULATIVE", "1") not in ("0", "false", "no")
+_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="asr-groq")
+
+# Connection keep-warm: Groq's edge closes idle connections, and reopening one
+# costs a TCP + TLS handshake on the user's next utterance. While a
+# conversation is active (a transcription within ASR_KEEPALIVE_ACTIVE_SECS),
+# a cheap models.list() every ASR_KEEPALIVE_SECS keeps the connection open.
+# Idle for longer, it stops — no pings around the clock. 0 disables.
+KEEPALIVE_SECS = float(os.environ.get("ASR_KEEPALIVE_SECS", "45"))
+KEEPALIVE_ACTIVE_SECS = float(os.environ.get("ASR_KEEPALIVE_ACTIVE_SECS", "600"))
+_last_activity = time.monotonic()
+
+_encoder: OnnxVoiceEncoder | None = None
+_encoder_failed = False
 _warned_unenrolled = False
+_warned_no_encoder = False
 
 
-def _get_encoder() -> VoiceEncoder:
-    """The resemblyzer encoder, built once.
+def _get_encoder() -> OnnxVoiceEncoder | None:
+    """The ONNX voice encoder, built once — or None if it can't load.
 
-    Its constructor print()s to stdout, which would corrupt the stdio MCP
-    stream — route that to stderr.
+    A failed load is not fatal: like an unenrolled voiceprint, the gate
+    fails open (every voice is transcribed) and the reason lands in the log.
     """
-    global _encoder
-    if _encoder is None:
-        with contextlib.redirect_stdout(sys.stderr):
-            _encoder = VoiceEncoder(device="cpu")
+    global _encoder, _encoder_failed
+    if _encoder is None and not _encoder_failed:
+        try:
+            _encoder = OnnxVoiceEncoder()
+        except Exception as e:
+            _encoder_failed = True
+            logger.error(f"voice encoder unavailable — speaker gate OFF ({e})")
     return _encoder
 
 
@@ -142,13 +187,14 @@ def _decode_wav(audio_b64: str, fmt: str) -> tuple[np.ndarray, int]:
 def _embed(audio_b64: str, fmt: str = "wav") -> np.ndarray:
     """L2-normalized speaker embedding of a speech segment.
 
-    Raises if the audio has no usable speech (too short or all silence),
-    which callers treat as a gate reject, not a crash.
+    Raises if the audio has no usable speech (too short or all silence) or
+    the encoder is unavailable — callers treat gate failures as rejects.
     """
+    encoder = _get_encoder()
+    if encoder is None:
+        raise RuntimeError("voice encoder unavailable (models/voice_encoder.onnx)")
     wav, rate = _decode_wav(audio_b64, fmt)
-    wav = preprocess_wav(wav, source_sr=rate)
-    with contextlib.redirect_stdout(sys.stderr):
-        return _get_encoder().embed_utterance(wav)
+    return encoder.embed_utterance(wav, source_sr=rate)
 
 
 @mcp.tool()
@@ -177,56 +223,14 @@ def enroll(audio_b64: str, fmt: str = "wav") -> str:
     )
 
 
-@mcp.tool()
-def transcribe(audio_b64: str, fmt: str = "wav") -> str:
-    """Transcribe Base64 audio using Groq Whisper — owner's voice only.
-
-    Speech whose voiceprint does not match the enrolled owner returns the
-    not-owner marker, so other speakers or the TV never become Lava's
-    turns — and the UI can toast "Not your voice" instead of mistaking a
-    rejected voice for real silence (owner spoke, Whisper heard nothing).
-    """
-    voiceprint = _load_voiceprint()
-    if voiceprint is None:
-        global _warned_unenrolled
-        if not _warned_unenrolled:
-            logger.warning(
-                "No voiceprint enrolled — speaker gating is OFF "
-                "(run agent/enroll_voice.py to enable it)"
-            )
-            _warned_unenrolled = True
-    else:
-        try:
-            similarity = float(
-                np.dot(voiceprint["embedding"], _embed(audio_b64, fmt))
-            )
-        except Exception as e:
-            # Unembeddable audio (silence/noise, too short) — treat as a
-            # reject rather than crashing the ASR call.
-            logger.info(f"ASR gate: speech unembeddable ({e}) — rejected")
-            return _NOT_OWNER
-        logger.info(f"ASR gate: similarity {similarity:.2f} (threshold {MIN_SIMILARITY})")
-        if similarity < MIN_SIMILARITY:
-            logger.info(
-                f"ASR gate: rejected — not {voiceprint['owner']}'s voice"
-            )
-            return _NOT_OWNER
-
-    audio = base64.b64decode(audio_b64)
-    if fmt in ("raw", "pcm"):
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(16000)
-            wav.writeframes(audio)
-        audio = buffer.getvalue()
-        fmt = "wav"
+def _whisper(audio: bytes, fmt: str) -> str:
+    """One Groq Whisper request (the SDK retries transient failures)."""
     try:
         result = groq.audio.transcriptions.create(
             model=ASR_MODEL,
             file=(f"audio.{fmt}", io.BytesIO(audio)),
             language="en",
+            temperature=0.0,
         )
     except RateLimitError:
         # 429 — SDK already exhausted its retries. Log loudly so the
@@ -243,5 +247,92 @@ def transcribe(audio_b64: str, fmt: str = "wav") -> str:
     return result.text
 
 
+def _gate_accepts(voiceprint: dict, audio_b64: str, fmt: str) -> bool:
+    """True when the segment matches the enrolled owner's voiceprint."""
+    try:
+        similarity = float(np.dot(voiceprint["embedding"], _embed(audio_b64, fmt)))
+    except Exception as e:
+        # Unembeddable audio (silence/noise, too short) — treat as a
+        # reject rather than crashing the ASR call.
+        logger.info(f"ASR gate: speech unembeddable ({e}) — rejected")
+        return False
+    logger.info(f"ASR gate: similarity {similarity:.2f} (threshold {MIN_SIMILARITY})")
+    if similarity < MIN_SIMILARITY:
+        logger.info(f"ASR gate: rejected — not {voiceprint['owner']}'s voice")
+        return False
+    return True
+
+
+@mcp.tool()
+def transcribe(audio_b64: str, fmt: str = "wav") -> str:
+    """Transcribe Base64 audio using Groq Whisper — owner's voice only.
+
+    Speech whose voiceprint does not match the enrolled owner returns the
+    not-owner marker, so other speakers or the TV never become Lava's
+    turns — and the UI can toast "Not your voice" instead of mistaking a
+    rejected voice for real silence (owner spoke, Whisper heard nothing).
+    """
+    global _warned_unenrolled, _warned_no_encoder, _last_activity
+    _last_activity = time.monotonic()
+    voiceprint = _load_voiceprint()
+    encoder = _get_encoder() if voiceprint is not None else None
+    gated = voiceprint is not None and encoder is not None
+    if voiceprint is None:
+        if not _warned_unenrolled:
+            logger.warning(
+                "No voiceprint enrolled — speaker gating is OFF "
+                "(run agent/enroll_voice.py to enable it)"
+            )
+            _warned_unenrolled = True
+    elif encoder is None:
+        if not _warned_no_encoder:
+            logger.warning(
+                "Voice encoder unavailable — speaker gating is OFF "
+                "(every voice is transcribed; see the load error in the log)"
+            )
+            _warned_no_encoder = True
+
+    audio = base64.b64decode(audio_b64)
+    if fmt in ("raw", "pcm"):
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(audio)
+        audio = buffer.getvalue()
+        fmt = "wav"
+
+    if not gated:
+        return _whisper(audio, fmt)
+    if not SPECULATIVE:
+        return _whisper(audio, fmt) if _gate_accepts(voiceprint, audio_b64, fmt) else _NOT_OWNER
+
+    # Speculative: upload now, gate meanwhile; a reject discards the result
+    # (the request cannot be recalled once sent — its errors are dropped too).
+    pending = _POOL.submit(_whisper, audio, fmt)
+    if not _gate_accepts(voiceprint, audio_b64, fmt):
+        pending.add_done_callback(lambda f: f.exception())  # consume, don't log
+        return _NOT_OWNER
+    return pending.result()
+
+
+def _keep_warm() -> None:
+    """Open the Groq connection now, then keep it open while in use."""
+    while True:
+        try:
+            groq.models.list()
+        except Exception as e:
+            logger.debug(f"Groq keep-warm ping failed: {e}")
+        if KEEPALIVE_SECS <= 0:
+            return
+        time.sleep(KEEPALIVE_SECS)
+        while time.monotonic() - _last_activity > KEEPALIVE_ACTIVE_SECS:
+            time.sleep(KEEPALIVE_SECS)  # idle: stop pinging until speech returns
+
+
 if __name__ == "__main__":
+    # Daemon thread: the handshake happens at startup instead of on the
+    # user's first utterance.
+    threading.Thread(target=_keep_warm, name="groq-keep-warm", daemon=True).start()
     mcp.run(transport="stdio")

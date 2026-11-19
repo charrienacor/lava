@@ -36,6 +36,7 @@ Run:
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -47,7 +48,7 @@ from tool_gateway import gateway_schemas
 import prompt
 from asr import McpWhisperSTTService
 from tts import McpPiperTTSService
-from llm import create_llm
+from llm import create_llm, keep_warm
 from context import create_context
 
 from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
@@ -88,9 +89,24 @@ GATEWAY_SERVERS = {"github", "tavily", "time", "spotify"}
 GREETING_TEXT = "Hi I'm Lava, how can I help you today?"
 
 
+def input_filter():
+    """The mic-side noise filter: RNNoise, unless RNNOISE=0.
+
+    RNNoise runs at 48 kHz, so every 16 kHz mic frame is resampled up and
+    back down around it — a steady CPU cost on the Pi's four cores, which
+    Silero, SmartTurn, the speaker gate and Piper all compete for. The
+    browser client already applies WebRTC noise suppression
+    (ui/static/app.js getUserMedia), so on that path RNNOISE=0 drops the
+    duplicate work. Keep it on for raw mics (the RPi local client).
+    """
+    if os.environ.get("RNNOISE", "1") in ("0", "false", "no"):
+        return None
+    return RNNoiseFilter()
+
+
 async def run_bot(
     transport, runner_args: RunnerArguments, session=None,
-    mcp_clients=None, base_tools=None,
+    mcp_clients=None, base_tools=None, on_worker=None,
 ) -> None:
     """Run the voice bot for one client session.
 
@@ -115,6 +131,12 @@ async def run_bot(
     the shared clients and their tool schema to every session, so an orb tap
     pays none of the connect cost. When absent (dev runner), this function
     connects per session and closes the clients when the session ends.
+
+    `on_worker(worker, runner)` is an optional sync callback invoked right
+    after the worker joins the runner — fd-benchmark's adapter uses it to
+    hold the runner so it can cancel the pipeline when fdbench closes the
+    socket (client transports emit on_disconnected, not the server-side
+    on_client_disconnected this function listens for).
     """
     owns_clients = mcp_clients is None or base_tools is None
 
@@ -186,6 +208,9 @@ async def run_bot(
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
     await runner.add_workers(worker)
 
+    if on_worker is not None:
+        on_worker(worker, runner)
+
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         # Greeting: one fixed line, spoken straight through TTS — no LLM
@@ -220,9 +245,13 @@ async def run_bot(
         logger.info("Client disconnected")
         await runner.cancel()
 
+    # Handshake with Groq now, while the session boots and the greeting
+    # plays — not on the user's first turn (llm.py keep_warm).
+    warm_task = asyncio.create_task(keep_warm(llm))
     try:
         await runner.run()
     finally:
+        warm_task.cancel()
         # Only tear down what this session owns. Shared clients (passed in by
         # ui/server.py's _warm_up) outlive the session — they close at server
         # shutdown; pipeline teardown already drops the tool sessions.
@@ -243,14 +272,14 @@ async def bot(runner_args: RunnerArguments) -> None:
             audio_out_enabled=True,
             # Acoustic front-end: suppress music/TV/room noise before VAD and
             # ASR (RNNoise, on-device; see requirements.txt).
-            audio_in_filter=RNNoiseFilter(),
+            audio_in_filter=input_filter(),
         ),
         # Plain WebSocket audio streaming (custom clients / RPi local client).
         "websocket": lambda: FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            audio_in_filter=RNNoiseFilter(),
+            audio_in_filter=input_filter(),
             serializer=ProtobufFrameSerializer(),
         ),
     }

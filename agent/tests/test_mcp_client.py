@@ -21,3 +21,41 @@ def test_build_mcp_clients_offline():
     # Construction must not connect (no network here).
     for client in clients.values():
         assert client is not None
+
+
+def test_stdio_servers_receive_their_tuning_env(monkeypatch):
+    """ASR_*/TTS_* knobs reach their own stdio server (the SDK's sanitized
+    env dropped them) — and never leak to a different server."""
+    monkeypatch.setenv("ASR_SPEAKER_MIN_SIM", "0.7")
+    monkeypatch.setenv("TTS_DEBUG_WAV", "1")
+    clients = build_mcp_clients()
+    asr_env = clients["asr"]._server_params.env
+    tts_env = clients["tts"]._server_params.env
+    assert asr_env["ASR_SPEAKER_MIN_SIM"] == "0.7"
+    assert "TTS_DEBUG_WAV" not in asr_env
+    assert tts_env["TTS_DEBUG_WAV"] == "1"
+
+
+def test_tool_error_result_raises():
+    """An is_error result (a tool that raised server-side) must raise, not
+    come back as text — a Groq failure used to become the user's transcript."""
+    import asyncio
+
+    import pytest
+    from mcp.types import CallToolResult, TextContent
+
+    import mcp_client
+
+    class _Session:
+        async def call_tool(self, name, arguments):
+            return CallToolResult(
+                content=[TextContent(type="text", text="rate limited")], is_error=True
+            )
+
+    class _Client:
+        async def _open_session(self, as_owner):
+            return _Session()
+
+    with pytest.raises(mcp_client.McpToolError, match="rate limited"):
+        asyncio.run(mcp_client.call_mcp_tool(_Client(), "transcribe", {}, server="asr"))
+    assert mcp_client.HEALTH["asr"] is True  # reachable: the TOOL failed

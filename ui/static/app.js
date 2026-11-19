@@ -18,6 +18,8 @@ let scheduledSrcs = new Set(); // scheduled-but-unfinished BufferSources
 let chunkSr = null;      // sample rate of the utterance being scheduled
 let heardVoice = false;  // one-time confirm beep on first audio
 let reconnectTries = 0;  // self-heal after a server restart (see onclose)
+let reconnectTimer = null; // pending setTimeout(connect) so it can be cancelled
+let sessionId = 0;       // bumped on every connect/cancel; stale startMic runs bail out
 // Stable per-tab identity (survives the idle-timeout disconnect) so the
 // server can resume the same conversation when the orb is tapped again.
 let client_id = (() => {
@@ -62,7 +64,10 @@ function fitCanvas() {
 fitCanvas();
 window.addEventListener("resize", fitCanvas);
 
-const RES = 128;
+// Low-res render target, upscaled when drawn. 96 (down from 128) cuts the
+// per-frame pixel work by ~44% - the orb is soft anyway, and the Pi needs
+// that main-thread time for audio scheduling.
+const RES = 96;
 const buf = document.createElement("canvas");
 buf.width = RES; buf.height = RES;
 const bctx = buf.getContext("2d");
@@ -87,17 +92,17 @@ for (let i = 0; i < 256; i++) {
   while (k < STOPS.length - 2 && t > STOPS[k + 1][0]) k++;
   const a = STOPS[k], b = STOPS[k + 1];
   const f = Math.min(1, Math.max(0, (t - a[0]) / (b[0] - a[0])));
-  LUT[i * 3]     = a[1] + (b[1] - a[1]) * f;
+  LUT[i * 3] = a[1] + (b[1] - a[1]) * f;
   LUT[i * 3 + 1] = a[2] + (b[2] - a[2]) * f;
   LUT[i * 3 + 2] = a[3] + (b[3] - a[3]) * f;
 }
 
 // per-state motion targets (interpolated smoothly every frame)
 const TARGETS = {
-  idle:      { rot: 0.12, energy: 0.32, swirl: 0.10, bright: 0.85, blobs: 4 },
+  idle: { rot: 0.12, energy: 0.32, swirl: 0.10, bright: 0.85, blobs: 4 },
   listening: { rot: 0.28, energy: 0.55, swirl: 0.22, bright: 0.97, blobs: 5 },
-  thinking:  { rot: 1.10, energy: 1.00, swirl: 1.00, bright: 1.12, blobs: 7 },
-  speaking:  { rot: 0.42, energy: 0.70, swirl: 0.38, bright: 1.00, blobs: 6 },
+  thinking: { rot: 1.10, energy: 1.00, swirl: 1.00, bright: 1.12, blobs: 7 },
+  speaking: { rot: 0.42, energy: 0.70, swirl: 0.38, bright: 1.00, blobs: 6 },
 };
 const P = { rot: 0.12, energy: 0.32, swirl: 0.10, bright: 0.85, blobs: 4 };
 
@@ -128,7 +133,7 @@ let HX = LX, HY = LY, HZ = LZ + 1;
 
 // Per-pixel static geometry and shading, precomputed once: the old loop
 // recomputed sqrt/pow chains (limb darkening, ^12 specular, tilt transform)
-// for all 16k pixels on every frame - ~half the render cost for pixels that
+// for all pixels on every frame - ~half the render cost for pixels that
 // never change. The per-frame loop below only evaluates the dynamic field.
 const N_PX = RES * RES;
 const A = new Uint8Array(N_PX);            // alpha incl. limb feather (0 = outside)
@@ -200,9 +205,9 @@ const EYEB = new Float32Array(N_PX);       // eyes squinted (blend target)
       const dy = vy - EYE_Y;
       const dR = (vx - EYE_X) * (vx - EYE_X), dL = (vx + EYE_X) * (vx + EYE_X);
       EYEA[i] = Math.max(Math.exp(-(dR * EYE_WI + dy * dy * EYE_HI)),
-                         Math.exp(-(dL * EYE_WI + dy * dy * EYE_HI)));
+        Math.exp(-(dL * EYE_WI + dy * dy * EYE_HI)));
       EYEB[i] = Math.max(Math.exp(-(dR * EYE_WI + dy * dy * EYE_HIn)),
-                         Math.exp(-(dL * EYE_WI + dy * dy * EYE_HIn)));
+        Math.exp(-(dL * EYE_WI + dy * dy * EYE_HIn)));
     }
   }
 }
@@ -211,9 +216,9 @@ const EYEB = new Float32Array(N_PX);       // eyes squinted (blend target)
 // smile, < 0 arches it into a frown; amp is the seam's heat, eye the glow of
 // the eyes, squint narrows them (concern; blinks ride on top of it).
 const FACE_EXPR = {
-  online:   { curve:  0.078, amp: 0.205, eye: 0.130, squint: 0.08 },
-  retrying: { curve:  0.012, amp: 0.125, eye: 0.100, squint: 0.48 },
-  offline:  { curve: -0.055, amp: 0.105, eye: 0.088, squint: 0.20 },
+  online: { curve: 0.078, amp: 0.205, eye: 0.130, squint: 0.08 },
+  retrying: { curve: 0.012, amp: 0.125, eye: 0.100, squint: 0.48 },
+  offline: { curve: -0.055, amp: 0.105, eye: 0.088, squint: 0.20 },
 };
 let connPhase = "offline";  // offline | retrying | online (drives the face)
 const FP = { curve: -0.055, amp: 0.105, eye: 0.088, squint: 0.20 };
@@ -231,14 +236,16 @@ function renderPlanet(t, dt) {
   const T0 = TARGETS[state] || TARGETS.idle;
   const calm = REDUCED_MOTION.matches ? 0.25 : 1;
   const T = calm === 1 ? T0
-    : { rot: T0.rot * calm, energy: T0.energy, swirl: T0.swirl * calm,
-        bright: T0.bright, blobs: T0.blobs };
+    : {
+      rot: T0.rot * calm, energy: T0.energy, swirl: T0.swirl * calm,
+      bright: T0.bright, blobs: T0.blobs
+    };
   const s = Math.min(1, dt * 2.5);
-  P.rot    += (T.rot    - P.rot)    * s;
+  P.rot += (T.rot - P.rot) * s;
   P.energy += (T.energy - P.energy) * s;
-  P.swirl  += (T.swirl  - P.swirl)  * s;
+  P.swirl += (T.swirl - P.swirl) * s;
   P.bright += (T.bright - P.bright) * s;
-  P.blobs  += (T.blobs  - P.blobs)  * s;
+  P.blobs += (T.blobs - P.blobs) * s;
   rotAngle += P.rot * dt * (1 + 0.6 * P.energy);
 
   // --- audio levels ---
@@ -256,9 +263,9 @@ function renderPlanet(t, dt) {
   // --- expression: ease toward the connection phase's face ---
   const FT = FACE_EXPR[connPhase] || FACE_EXPR.offline;
   const fs = Math.min(1, dt * 1.7);
-  FP.curve  += (FT.curve  - FP.curve)  * fs;
-  FP.amp    += (FT.amp    - FP.amp)    * fs;
-  FP.eye    += (FT.eye    - FP.eye)    * fs;
+  FP.curve += (FT.curve - FP.curve) * fs;
+  FP.amp += (FT.amp - FP.amp) * fs;
+  FP.eye += (FT.eye - FP.eye) * fs;
   FP.squint += (FT.squint - FP.squint) * fs;
   // an occasional blink keeps the face alive; it rides on the squint blend
   if (t >= nextBlink) { blinkAt = t; nextBlink = t + 3.5 + Math.random() * 3.5; }
@@ -267,7 +274,7 @@ function renderPlanet(t, dt) {
   const fSquint = Math.min(1, FP.squint + blink);
   const fCurve = FP.curve + 0.01 * Math.sin(t * 0.45);   // gentle mood drift
   const fAmp = FP.amp * (0.86 + 0.14 * Math.sin(t * 0.9))   // seam shimmer
-             + (state === "speaking" ? 0.2 * speechLevel : 0); // talk flare
+    + (state === "speaking" ? 0.2 * speechLevel : 0); // talk flare
   const fEye = FP.eye + (state === "listening" ? 0.05 * Math.min(1, micLevel) : 0);
 
   // --- blob positions in the planet frame ---
@@ -343,7 +350,7 @@ function renderPlanet(t, dt) {
     // ---- precomputed spherical shading (key light, specular, limb) ----
     const shade = LIT[i] * LIMB[i] * bright;
     const sp = SPEC[i] * LIMB[i] * bright;
-    px[idx]     = LUT[ci * 3]     * shade + 255 * sp;
+    px[idx] = LUT[ci * 3] * shade + 255 * sp;
     px[idx + 1] = LUT[ci * 3 + 1] * shade + 236 * sp;
     px[idx + 2] = LUT[ci * 3 + 2] * shade + 210 * sp;
     px[idx + 3] = a;
@@ -367,11 +374,11 @@ function renderPlanet(t, dt) {
   ctx2d.drawImage(buf, SIZE / 2 - drawR, SIZE / 2 - drawR, drawR * 2, drawR * 2);
 }
 
-// Frame-rate cap: the orb's motion is slow, and on a 60 Hz display a 20 ms
-// minimum makes the loop render every other frame (~30 fps) - visually
-// identical for this animation, and it frees real main-thread time for the
-// audio scheduling and WebSocket work that share this thread.
-const FRAME_MIN_MS = 20;
+// Frame-rate cap: the orb's motion is slow, and ~30 fps is visually
+// identical for this animation while freeing real main-thread time for the
+// audio scheduling and WebSocket work that share this thread (important on
+// a Raspberry Pi, where Chromium, Piper and the orb share four cores).
+const FRAME_MIN_MS = 33;
 // prefers-reduced-motion: drop to ~4 fps, advance the ambient clock at 0.15x
 // and damp spin/swirl (see renderPlanet) - the planet becomes a slow drift
 // while states still ease and audio swells still register.
@@ -472,13 +479,29 @@ function finalizeBotRow() {
 // ---------------- bot audio playback ----------------
 function ensureBotCtx() {
   if (!botAudioCtx) {
-    botAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // "playback" asks the browser for a larger output buffer: slightly more
+    // latency, far fewer underruns on a busy Raspberry Pi.
+    botAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      latencyHint: "playback",
+    });
     botGain = botAudioCtx.createGain();
     botGain.connect(botAudioCtx.destination);
     botAnalyser = botAudioCtx.createAnalyser();
     botAnalyser.fftSize = 1024;
     botMicData = new Float32Array(botAnalyser.fftSize);
     botGain.connect(botAnalyser);
+    // Keep the output device awake with an inaudible signal, so the first
+    // word of a reply doesn't hit a cold/suspended sink (gappy start).
+    if (botAudioCtx.createConstantSource) {
+      try {
+        const keepAlive = botAudioCtx.createConstantSource();
+        const kaGain = botAudioCtx.createGain();
+        kaGain.gain.value = 0.00001;
+        keepAlive.connect(kaGain);
+        kaGain.connect(botAudioCtx.destination);
+        keepAlive.start();
+      } catch (e) { }
+    }
     botAudioCtx.addEventListener("statechange", updateSoundBanner);
   }
   unlockAudio();
@@ -489,7 +512,7 @@ function unlockAudio() {
   if (!botAudioCtx) return;
   if (botAudioCtx.state === "suspended") {
     const p = botAudioCtx.resume();
-    if (p && p.then) p.then(() => { drainBotQueue(); }).catch(() => {});
+    if (p && p.then) p.then(() => { drainBotQueue(); }).catch(() => { });
   } else {
     drainBotQueue();
   }
@@ -516,6 +539,40 @@ function playConfirmBeep() {
   o.start(t); o.stop(t + 0.2);
 }
 
+// Start-of-reply gather: the first packet of a reply is held for up to
+// ~80 ms (or until ~120 ms of audio has arrived) so it is never scheduled
+// alone with a gap before the second packet.
+const START_GATHER_MS = 120;
+const START_WAIT_MS = 80;
+// A silence longer than this between chunks is a new reply, not an underrun.
+const NEW_REPLY_GAP_S = 1.5;
+let pending = [], pendingMs = 0, pendingTimer = null;
+
+function clearPending() {
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  pending = [];
+  pendingMs = 0;
+}
+
+function flushPending() {
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  const items = pending;
+  pending = [];
+  pendingMs = 0;
+  if (!botAudioCtx || botAudioCtx.state !== "running") {
+    // context got suspended while we were gathering: keep the audio queued
+    for (const it of items) botQueue.push(it);
+    return;
+  }
+  for (const it of items) scheduleChunk(it.data, it.sr);
+}
+
+function replyStarting() {
+  if (scheduledSrcs.size > 0) return false;
+  if (nextStartTime === 0) return true;
+  return botAudioCtx.currentTime - nextStartTime > NEW_REPLY_GAP_S;
+}
+
 function enqueueAudio(i16, sr) {
   ensureBotCtx();
   // int16 PCM -> [-1, 1] for AudioBuffer.copyToChannel().
@@ -528,34 +585,114 @@ function enqueueAudio(i16, sr) {
     unlockAudio();
     return;
   }
+  if (pending.length || replyStarting()) {
+    pending.push({ data: f32, sr });
+    pendingMs += (f32.length / sr) * 1000;
+    if (pendingMs >= START_GATHER_MS) flushPending();
+    else if (!pendingTimer) pendingTimer = setTimeout(flushPending, START_WAIT_MS);
+    return;
+  }
   drainBotQueue();
   scheduleChunk(f32, sr);
 }
 
 
+// Jitter buffer. The server paces reply audio in real time (one 40 ms packet
+// every 40 ms), so whatever is scheduled ahead of the playhead is the only
+// cushion against late packets. On a Raspberry Pi (Chromium + the orb
+// renderer + Piper share four cores) a small cushion gets missed and the
+// start of the reply comes out gappy and "stretched". So the cushion starts
+// generous and grows each time a gap actually happens mid-reply; the learned
+// value is remembered per device. Barge-in is unaffected: stopBotAudio()
+// kills scheduled sources instantly regardless of how far ahead they sit.
+// (The storage key is versioned so values learned under the old, smaller
+// limits don't pin the cushion too low.)
+const LEAD_MIN = 0.15, LEAD_MAX = 0.60, LEAD_STEP = 0.10;
+const LEAD_KEY = "lava.jitterLead2";
+let jitterLead = LEAD_MIN;
+try {
+  const saved = parseFloat(localStorage.getItem(LEAD_KEY));
+  if (saved) jitterLead = Math.min(LEAD_MAX, Math.max(LEAD_MIN, saved));
+} catch (e) { }
+
+// Continuous resampler. Every packet used to be handed to the browser as its
+// own AudioBuffer at the TTS rate (e.g. 22050 Hz) while the context runs at
+// 48000/44100 Hz, so each 40 ms packet was resampled IN ISOLATION: the
+// interpolator has no history at the buffer edges, which leaves a tiny dip or
+// tick at every packet boundary even when the timing is perfect (hence "gaps"
+// with no underrun logged). Here the resampling happens ourselves, with the
+// last samples carried across packets (Catmull-Rom), so the stream is seamless
+// and the buffers handed to Web Audio already match the context rate.
+let rsTail = new Float32Array(3);   // last 3 input samples of the previous packet
+let rsPos = 3;                      // read position in [tail(3) + packet] coordinates
+function resetResampler() { rsTail = new Float32Array(3); rsPos = 3; }
+
+function resampleStream(cur, srIn, srOut) {
+  if (srIn === srOut) return cur;
+  const ratio = srIn / srOut;
+  const n = cur.length, L = n + 3;
+  const e = new Float32Array(L);
+  e.set(rsTail, 0);
+  e.set(cur, 3);
+  const count = Math.max(0, Math.ceil((L - 2 - rsPos) / ratio));
+  const out = new Float32Array(count);
+  for (let k = 0; k < count; k++) {
+    const pos = rsPos + k * ratio;
+    const i = Math.floor(pos);
+    const t = pos - i;
+    const p0 = e[i - 1], p1 = e[i], p2 = e[i + 1], p3 = e[i + 2];
+    out[k] = p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
+  }
+  rsPos = rsPos + count * ratio - n;
+  rsTail = e.slice(L - 3);
+  return out;
+}
+
+// Packet start times are computed from an integer frame count instead of
+// summing float durations, so consecutive packets abut on exact sample frames.
+let baseFrame = 0, framesSched = 0;
+
 function scheduleChunk(f32, sr) {
-  if (chunkSr !== sr) { chunkSr = sr; nextStartTime = 0; }
+  if (chunkSr !== sr) { chunkSr = sr; nextStartTime = 0; resetResampler(); }
   const now = botAudioCtx.currentTime;
-  // Once scheduled, WebAudio plays on its own thread - the enemy is the gap
-  // between chunks: if delivery lags real time, a schedule primed only 20 ms
-  // ahead drained on every main-thread hiccup (the orb renderer, GC) and the
-  // reply stuttered. Keep ~120 ms buffered while streaming; the first chunk
-  // after a cut/new utterance stays tight so time-to-first-audio doesn't pay
-  // for it. Barge-in is unaffected: stopBotAudio() kills scheduled sources
-  // instantly regardless of how far ahead they sit.
-  const lead = nextStartTime > 0 ? 0.12 : 0.03;
-  if (nextStartTime < now + lead) nextStartTime = now + lead;
+  if (nextStartTime > 0 && nextStartTime < now) {
+    if (now - nextStartTime > NEW_REPLY_GAP_S) {
+      // Long silence: this is a new reply, not a gap inside one.
+      nextStartTime = 0;
+      resetResampler();
+    } else {
+      // Underrun: the previous chunk finished before this one arrived — an
+      // audible gap. Grow the cushion for the rest of this reply and the next.
+      jitterLead = Math.min(LEAD_MAX, jitterLead + LEAD_STEP);
+      try { localStorage.setItem(LEAD_KEY, jitterLead.toFixed(2)); } catch (e) { }
+      console.info(`[lava] playback underrun — jitter buffer now ${Math.round(jitterLead * 1000)} ms`);
+      // Rebuild the cushion NOW. Without this, nextStartTime stays > 0, the
+      // check below adds no lead, and the rest of the reply plays with zero
+      // buffer (so every later late packet is another gap).
+      nextStartTime = 0;
+    }
+  }
+  const rate = botAudioCtx.sampleRate;
+  const data = resampleStream(f32, sr, rate);
+  if (!data.length) return;
+  if (nextStartTime < now + (nextStartTime > 0 ? 0 : jitterLead)) {
+    baseFrame = Math.ceil((now + jitterLead) * rate);
+    framesSched = 0;
+  }
   try {
-    const buf = botAudioCtx.createBuffer(1, f32.length, sr);
-    buf.copyToChannel(f32, 0);
+    const audioBuf = botAudioCtx.createBuffer(1, data.length, rate);
+    audioBuf.copyToChannel(data, 0);
     const src = botAudioCtx.createBufferSource();
-    src.buffer = buf;
+    src.buffer = audioBuf;
     src.connect(botGain);
-    src.start(nextStartTime);
-    nextStartTime += buf.duration;
+    src.start((baseFrame + framesSched) / rate);
+    framesSched += data.length;
+    nextStartTime = (baseFrame + framesSched) / rate;
     scheduledSrcs.add(src);
     botPlaying = true;
-    setState("speaking");
+    // Only touch the DOM on a real transition: this runs for every 40 ms
+    // packet, and setState rewrites classes/aria/label each time.
+    if (state !== "speaking") setState("speaking");
     src.onended = () => {
       scheduledSrcs.delete(src);
       if (scheduledSrcs.size === 0) {
@@ -578,13 +715,15 @@ function drainBotQueue() {
 
 function stopBotAudio() {
   botQueue = [];
+  clearPending();
   nextStartTime = 0;
   chunkSr = null;
+  resetResampler();
   const srcs = [...scheduledSrcs];
   scheduledSrcs.clear();
   for (const src of srcs) {
     src.onended = null;
-    try { src.stop(); } catch (e) {}
+    try { src.stop(); } catch (e) { }
   }
   botPlaying = false;
   duckBot(false);
@@ -736,18 +875,25 @@ function toastShow(m) {
 
 // ---------------- websocket ----------------
 function connect() {
+  // Never hold two sockets: drop any pending retry and any live socket.
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { ws.onclose = null; try { ws.close(); } catch (e) { } ws = null; }
+  const mySession = ++sessionId;
   connPhase = "retrying";  // concerned face while attempting
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws?cid=${encodeURIComponent(client_id)}`);
-  ws.binaryType = "arraybuffer";
+  const sock = new WebSocket(`${proto}://${location.host}/ws?cid=${encodeURIComponent(client_id)}`);
+  ws = sock;
+  sock.binaryType = "arraybuffer";
 
-  ws.onopen = () => {
+  sock.onopen = () => {
+    if (sock !== ws) return;
     reconnectTries = 0;
     connPhase = "online";  // the smile arrives with the connection
-    startMic();
+    startMic(mySession);
   };
 
-  ws.onmessage = (ev) => {
+  sock.onmessage = (ev) => {
+    if (sock !== ws) return;
     // Binary frames are bot audio: uint16 LE sample rate + 16-bit LE mono PCM.
     if (ev.data instanceof ArrayBuffer) {
       if (!heardVoice) { heardVoice = true; playConfirmBeep(); }
@@ -759,6 +905,8 @@ function connect() {
     if (m.type === "busy") {
       // Another device owns the session: stop retrying, say so plainly.
       running = false;
+      reconnectTries = 0;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       connPhase = "offline";
       stopMic();
       if (ws) { ws.onclose = null; ws.close(); ws = null; }
@@ -773,7 +921,7 @@ function connect() {
       // Server detected user speech while the bot was talking - cut the
       // remaining audio right now (the Pi pipeline behaves the same way).
       stopBotAudio();
-      finalizeBotRow(null);
+      finalizeBotRow();
       setState("listening");
     } else if (m.type === "processing") {
       // The bridge has the utterance and is transcribing: switch to
@@ -785,24 +933,32 @@ function connect() {
     } else if (m.type === "timer") {
       // A timer/reminder came due: the announcement arrives as normal
       // speech (text/done events), this toast just names what fired.
-      toastShow({ type: "tool_done", key: "timer:" + (m.id || m.label || m.kind),
-                  cat: "timer", title: m.kind === "reminder" ? "Reminder" : "Timer",
-                  sub: m.label || "done" });
+      toastShow({
+        type: "tool_done", key: "timer:" + (m.id || m.label || m.kind),
+        cat: "timer", title: m.kind === "reminder" ? "Reminder" : "Timer",
+        sub: m.label || "done"
+      });
     } else if (m.type === "toast") {
       // Server-initiated notice (rate limits, …) in the tool tray; the
       // server throttles repeats, the tray dedupes by key.
-      toastShow({ type: "tool_done", key: m.key, cat: m.cat,
-                  title: m.title, sub: m.sub });
+      toastShow({
+        type: "tool_done", key: m.key, cat: m.cat,
+        title: m.title, sub: m.sub
+      });
       setTimeout(() => toastDismiss(m.key), 6000);
     } else if (m.type === "voice_enrolled") {
-      toastShow({ type: "tool_done", key: "voice", cat: "system",
-                  title: "Voice enrolled", sub: "only your voice starts turns now" });
+      toastShow({
+        type: "tool_done", key: "voice", cat: "system",
+        title: "Voice enrolled", sub: "only your voice starts turns now"
+      });
     } else if (m.type === "voice_rejected") {
       // Someone (or something) else spoke: the utterance was dropped
       // before it could become a turn. One shared toast key, so repeats
       // refresh it instead of stacking.
-      toastShow({ type: "tool_done", key: "voice", cat: "system",
-                  title: "Unknown voice", sub: "ignored — not the enrolled voiceprint" });
+      toastShow({
+        type: "tool_done", key: "voice", cat: "system",
+        title: "Unknown voice", sub: "ignored — not the enrolled voiceprint"
+      });
     } else if (m.type === "mcp") {
       // Live tool policy: a TOML allowlist changed on disk (or the connect
       // push arrived). Re-render the tray; toast only on later updates.
@@ -839,12 +995,12 @@ function connect() {
         const rows = chat.querySelectorAll(".row.user");
         if (rows.length) rows[rows.length - 1].remove();
       }
-      finalizeBotRow(m.stats);
+      finalizeBotRow();
       // The turn is over, but queued audio may still be playing (the server
       // pipelines TTS) - onended flips the state when playback truly ends.
       if (running && !botPlaying) setState("listening");
     } else if (m.type === "error") {
-      finalizeBotRow(null);
+      finalizeBotRow();
       if (running && !botPlaying) setState("listening");
     } else if (m.type === "silence") {
       // Same guard as done/error: with a deferred overlap the bot may still
@@ -855,6 +1011,8 @@ function connect() {
       // Stop the mic quietly - no banner. The orb drops back down and the
       // next tap resumes the same conversation (the server keeps it by cid).
       running = false;
+      reconnectTries = 0;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       connPhase = "offline";
       stopMic();
       stopBotAudio();
@@ -863,29 +1021,49 @@ function connect() {
     }
   };
 
-  ws.onclose = () => {
-    if (running) {
+  sock.onclose = () => {
+    if (sock !== ws) return;  // a superseded socket closing: ignore
+    ws = null;
+    const wasRunning = running;
+    if (wasRunning) {
       running = false;
       stopMic();
       stopBotAudio();
       setState("idle");
-      // The server may just be restarting: keep retrying for ~30 s instead of
-      // the single silent attempt that used to leave the orb dead until the
-      // page was reloaded.
+    }
+    // The server may just be restarting: keep retrying for ~30 s instead of
+    // the single silent attempt that used to leave the orb dead until the
+    // page was reloaded. A retry that itself fails (reconnectTries > 0 but
+    // never running) must keep the loop going too.
+    if (wasRunning || reconnectTries > 0) {
       if (reconnectTries < 20) {
         reconnectTries += 1;
         connPhase = "retrying";
         stateLabel.textContent = "reconnecting";
         stateLabel.classList.remove("hide");
-        setTimeout(connect, 1500);
+        reconnectTimer = setTimeout(connect, 1500);
       } else {
+        // Gave up: back to rest so the next tap starts fresh.
+        reconnectTries = 0;
         connPhase = "offline";
+        setState("idle");
       }
-    } else if (reconnectTries === 0) {
+    } else {
       connPhase = "offline";  // first attempt never opened; back to rest
     }
   };
-  ws.onerror = () => ws.close();
+  sock.onerror = () => { try { sock.close(); } catch (e) { } };
+}
+
+// Cancel whatever connection work is in flight (pending retry, a socket that
+// is still connecting, or one waiting on the mic prompt) and go back to idle.
+function cancelConnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectTries = 0;
+  sessionId++;  // any startMic still awaiting will see it is stale and bail
+  connPhase = "offline";
+  if (ws) { ws.onclose = null; try { ws.close(); } catch (e) { } ws = null; }
+  setState("idle");
 }
 
 // ---------------- mic permission recovery ----------------
@@ -940,35 +1118,54 @@ function micFailed(e) {
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
 }
 
-async function startMic() {
+async function startMic(mySession) {
+  // startMic awaits several times (permission prompt, context resume, worklet
+  // load). The session can end in that window - orb tapped off, socket
+  // closed - so everything is built in locals and only committed to the
+  // globals if the session is still the live one.
+  const alive = () =>
+    mySession === sessionId && ws && ws.readyState === WebSocket.OPEN;
+  let stream = null, ctx = null;
+  const abort = () => {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (ctx) { try { ctx.close().catch(() => { }); } catch (e) { } }
+  };
+
   const want = { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false } };
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia(want);
+    stream = await navigator.mediaDevices.getUserMedia(want);
   } catch (e) {
     // Safari can reject the constraint dict outright (channelCount et al.);
     // fall back to a bare audio request, the browser's defaults are fine.
-    if (e.name !== "OverconstrainedError" && e.name !== "TypeError") return micFailed(e);
+    if (e.name !== "OverconstrainedError" && e.name !== "TypeError") {
+      if (alive()) micFailed(e);
+      return;
+    }
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e2) {
-      return micFailed(e2);
+      if (alive()) micFailed(e2);
+      return;
     }
   }
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR_IN });
-  if (audioCtx.state === "suspended") await audioCtx.resume();
-  const srcNode = audioCtx.createMediaStreamSource(mediaStream);
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 1024;
-  micData = new Float32Array(analyser.fftSize);
-  srcNode.connect(analyser);
+  if (!alive()) { abort(); return; }
+
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR_IN });
+  if (ctx.state === "suspended") { try { await ctx.resume(); } catch (e) { } }
+  const srcNode = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  const data = new Float32Array(an.fftSize);
+  srcNode.connect(an);
 
   // Raw PCM via an AudioWorklet, batched to 512-sample (32 ms) binary frames.
   // The worklet also does the float->int16 conversion, so the main thread only
   // forwards an ArrayBuffer. The server's Silero VAD consumes 512-sample
   // frames anyway, so batching here costs zero end-to-end latency while
   // cutting websocket message rate 4x vs per-quantum (128-sample) sends.
+  let node = null;
   let useWorklet = false;
-  if (audioCtx.audioWorklet) {
+  if (ctx.audioWorklet) {
     try {
       const workletCode = `
 class PcmTap extends AudioWorkletProcessor {
@@ -992,20 +1189,23 @@ class PcmTap extends AudioWorkletProcessor {
 }
 registerProcessor("pcm-tap", PcmTap);`;
       const blobUrl = URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" }));
-      await audioCtx.audioWorklet.addModule(blobUrl);
-      URL.revokeObjectURL(blobUrl);
-      processor = new AudioWorkletNode(audioCtx, "pcm-tap", { numberOfOutputs: 1, outputChannelCount: [1] });
-      processor.port.onmessage = (ev) => sendMicFrame(ev.data);
-      srcNode.connect(processor);
+      try {
+        await ctx.audioWorklet.addModule(blobUrl);
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
+      node = new AudioWorkletNode(ctx, "pcm-tap", { numberOfOutputs: 1, outputChannelCount: [1] });
+      node.port.onmessage = (ev) => sendMicFrame(ev.data);
+      srcNode.connect(node);
       useWorklet = true;
     } catch (e) {
       console.warn("[lava] AudioWorklet unavailable, using ScriptProcessor:", e);
-      processor = null;
+      node = null;
     }
   }
   if (!useWorklet) {
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (ev) => {
+    node = ctx.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = (ev) => {
       const f = ev.inputBuffer.getChannelData(0);
       const i16 = new Int16Array(f.length);
       for (let i = 0; i < f.length; i++) {
@@ -1014,13 +1214,23 @@ registerProcessor("pcm-tap", PcmTap);`;
       }
       sendMicFrame(i16.buffer);
     };
-    srcNode.connect(processor);
+    srcNode.connect(node);
   }
   // Keep the capture node pulled (browsers GC a silent-tail processor).
-  const sink = audioCtx.createGain();
+  const sink = ctx.createGain();
   sink.gain.value = 0;
-  processor.connect(sink);
-  sink.connect(audioCtx.destination);
+  node.connect(sink);
+  sink.connect(ctx.destination);
+
+  // The awaits are done. If the session ended meanwhile, release everything
+  // we built instead of committing it (and never touch a null socket).
+  if (!alive()) { abort(); return; }
+
+  mediaStream = stream;
+  audioCtx = ctx;
+  analyser = an;
+  micData = data;
+  processor = node;
 
   running = true;
   // One-way latch: once the orb has risen for a call, it stays up even
@@ -1036,24 +1246,45 @@ registerProcessor("pcm-tap", PcmTap);`;
   //   {"type":"ready"} gates the pipeline's VAD/turns (talking over the
   //                    greeting barges it) and the fallback greeting when
   //                    the warm cache is empty.
-  fetch("/api/greet?cid=" + encodeURIComponent(client_id), { method: "POST" }).catch(() => {});
+  fetch("/api/greet?cid=" + encodeURIComponent(client_id), { method: "POST" }).catch(() => { });
   ws.send(JSON.stringify({ type: "ready" }));
 }
 
 function stopMic() {
-  if (processor) { try { processor.disconnect(); } catch(e){} processor = null; }
+  if (processor) {
+    try {
+      if (processor.port) processor.port.onmessage = null;
+      processor.onaudioprocess = null;
+      processor.disconnect();
+    } catch (e) { }
+    processor = null;
+  }
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (audioCtx) {
+    const c = audioCtx;
+    audioCtx = null;
+    try { c.close().catch(() => { }); } catch (e) { }  // close() returns a promise
+  }
   analyser = null; micData = null;
 }
 
 // ---------------- toggle ----------------
 orbWrap.addEventListener("click", () => {
   if (!running) {
+    // A retry timer, a still-connecting socket, or a socket waiting on the
+    // mic prompt means connection work is already in flight: a tap cancels
+    // it (back to idle) instead of opening a second socket on top of it.
+    if (reconnectTimer || ws) {
+      cancelConnect();
+      return;
+    }
     ensureBotCtx();
     connect();
   } else {
     running = false;
+    sessionId++;
+    reconnectTries = 0;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     connPhase = "offline";
     stopMic();
     stopBotAudio();
@@ -1198,7 +1429,7 @@ function renderMcpTray(servers) {
 fetch("/api/allowlist")
   .then((r) => r.json())
   .then((d) => renderMcpTray(d.servers))
-  .catch(() => {});  // offline until the websocket pushes the snapshot
+  .catch(() => { });  // offline until the websocket pushes the snapshot
 
 // Delegated tray clicks: one accordion per group (one unfolded at a time),
 // tool chips send their prompt as a normal user turn through the pipeline.
@@ -1223,8 +1454,10 @@ mcpTrayPanel.addEventListener("click", (e) => {
 function askLava(text) {
   if (!text) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    toastShow({ key: "tray-offline", cat: "tray", title: "Lava is offline",
-                sub: "Tap the orb to connect first" });
+    toastShow({
+      key: "tray-offline", cat: "tray", title: "Lava is offline",
+      sub: "Tap the orb to connect first"
+    });
     setTimeout(() => toastDismiss("tray-offline"), 4000);
     return;
   }

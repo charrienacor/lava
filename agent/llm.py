@@ -19,6 +19,7 @@ import time
 from typing import Awaitable, Callable
 
 import openai
+from loguru import logger
 from pipecat.services.groq.llm import GroqLLMService
 
 DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
@@ -125,6 +126,29 @@ def create_llm(system_instruction: str | None = None) -> GroqLLMService:
     )
     _wire_rate_limit_watch(llm)
     return _wire_model_fallback(llm, groq_model(), fallback_model())
+
+
+async def keep_warm(llm: GroqLLMService) -> None:
+    """Open the LLM's HTTPS connection now and keep it open for the session.
+
+    Each session builds a fresh client, so its first turn paid DNS + TCP +
+    TLS to Groq before the first token could arrive; and a connection idle
+    between turns can be closed by Groq's edge, charging the handshake
+    again. A models.list() at session start and every LLM_KEEPALIVE_SECS
+    after (default 45; 0 = warm once, no pings) keeps the socket hot. The
+    pings use no tokens. Run as a task; the session cancels it on exit.
+    """
+    interval = float(os.environ.get("LLM_KEEPALIVE_SECS", "45"))
+    while True:
+        try:
+            await llm._client.models.list()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"LLM keep-warm ping failed: {e}")
+        if interval <= 0:
+            return
+        await asyncio.sleep(interval)
 
 
 def _wire_rate_limit_watch(llm: GroqLLMService) -> GroqLLMService:

@@ -22,6 +22,9 @@ voices/*.onnx.json
 data/
 myfiles/
 
+# benchmark tool (own repo, own venv)
+fd-benchmark/
+
 # os noise
 .DS_Store
 

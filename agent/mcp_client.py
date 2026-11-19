@@ -96,7 +96,14 @@ def build_mcp_clients() -> dict[str, MCPClient]:
         kind = spec.get("type", "stdio")
         try:
             if kind == "stdio":
-                declared_env = spec.get("env") or {}
+                # The SDK hands a stdio server only a sanitized env (HOME,
+                # PATH, ...), so tuning knobs like ASR_SPEAKER_MIN_SIM or
+                # TTS_DEBUG_WAV in .env never reached our own servers. Pass
+                # through every <NAME>_* var (ASR_*, TTS_*) — optional by
+                # nature, unlike ${VAR} placeholders, which are required.
+                prefix = f"{name.upper()}_"
+                tuning = {k: v for k, v in os.environ.items() if k.startswith(prefix)}
+                declared_env = {**tuning, **(spec.get("env") or {})}
                 params = StdioServerParameters(
                     command=spec["command"],
                     args=spec.get("args", []),
@@ -154,6 +161,10 @@ def build_mcp_clients() -> dict[str, MCPClient]:
     return clients
 
 
+class McpToolError(RuntimeError):
+    """The server ran the tool and the tool itself failed (is_error result)."""
+
+
 async def call_mcp_tool(
     client: MCPClient, name: str, arguments: dict[str, Any], server: str | None = None
 ) -> str:
@@ -171,8 +182,8 @@ async def call_mcp_tool(
     """
     try:
         return await _call_mcp_tool_once(client, name, arguments, server)
-    except asyncio.CancelledError:
-        raise  # barge-in or shutdown: let the caller unwind
+    except (asyncio.CancelledError, McpToolError):
+        raise  # barge-in/shutdown, or a tool error: a reconnect cannot help
     except Exception as e:
         if _is_connection_lost(e) or "connection closed" in str(e).lower():
             logger.warning(f"MCP '{server or '?'}': dead session — reconnecting once")
@@ -201,7 +212,13 @@ async def _call_mcp_tool_once(
     text = "".join(
         c.text for c in (result.content or []) if isinstance(c, TextContent) and c.text
     )
-    HEALTH[server] = True
+    HEALTH[server] = True  # the server answered — reachable even if the tool failed
+    if result.is_error:
+        # A tool that raises comes back as a NORMAL result with is_error set
+        # and the exception text as content. Returned as-is, a Groq 429 in
+        # the asr server became the user's "transcript" and a failed gateway
+        # call never counted toward the circuit breaker.
+        raise McpToolError(f"MCP tool '{name}' failed: {text or 'unknown error'}")
     return text
 
 

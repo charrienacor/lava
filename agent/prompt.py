@@ -15,6 +15,8 @@ locally on a Raspberry Pi 4.
 _STYLE = """\
 Voice style:
 - Keep answers short and natural — one or two sentences, then stop.
+- Make the first sentence short (under ten words): speech starts only once
+  it is complete, so lead with the answer, not a preamble.
 - If the user starts speaking, stop and listen right away.
 - Read URLs, code, and markdown as plain speech, never symbol by symbol.
 - Patience: ask a clarifying question at most ONCE per request. If the
@@ -37,8 +39,11 @@ def _profile_section(path: Path | None = None) -> str:
     path = path or PROFILE_YAML  # late-bound: tests and callers can override
     try:
         data = yaml.safe_load(path.read_text()) or {}
-    except (FileNotFoundError, yaml.YAMLError) as e:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         logger.warning(f"{path.name} unreadable ({e}) — running with the base prompt")
+        return ""
+    if not isinstance(data, dict):
+        logger.warning(f"{path.name} is not a mapping — running with the base prompt")
         return ""
 
     user = data.get("user") or {}
