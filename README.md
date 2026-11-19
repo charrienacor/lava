@@ -127,6 +127,10 @@ time-to-first-audio split (`TTFA … endpointing+ASR …, LLM+TTS …`).
 
 ## Spotify connection
 
+The remote Spotify MCP server (`https://spotify-mcp.charrienacor.workers.dev/mcp`
+in `mcp_servers.json`) is [spotify-mcp-cloudflare](https://github.com/charrienacor/spotify-mcp-cloudflare)
+— deployed from that repo to Cloudflare Workers.
+
 No OAuth helper: the bearer lives in `.env` as `SPOTIFY_ACCESS_TOKEN` and is
 sent verbatim (`mcp_servers.json` expands `${SPOTIFY_ACCESS_TOKEN}` into the
 Authorization header). Renew it yourself when it expires — e.g. with
