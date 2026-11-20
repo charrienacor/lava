@@ -5,8 +5,8 @@ from mcp_client import build_mcp_clients, load_allowlist
 
 def test_allowlists():
     gh = load_allowlist("github")
-    assert len(gh) == 9
-    assert "merge_pull_request" in gh and "delete_file" not in gh
+    assert len(gh) == 10
+    assert "merge_pull_request" in gh and "delete_file" in gh
     assert load_allowlist("tts") == ["speak"]
     assert load_allowlist("time") == ["convert_time", "get_current_time"]
 

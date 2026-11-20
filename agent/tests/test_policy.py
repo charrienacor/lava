@@ -28,6 +28,40 @@ def test_confirm_implies_enabled():
                 )
 
 
+def test_confirm_gated_tools_declare_identity():
+    """Approval binding is TOML policy: every confirm-gated tool declares
+    `identity = [...]` — the argument keys its spoken "yes" binds to
+    (tool_gateway._identity). Unmapped gated tools still work via the
+    strict full-args fallback, but the known ones pin their bindings here
+    so a TOML typo can't quietly loosen an approval."""
+    expected = {
+        ("github", "merge_pull_request"): {"owner", "repo", "pullNumber"},
+        ("github", "create_or_update_file"): {"owner", "repo", "branch", "path"},
+        ("github", "push_files"): {"owner", "repo", "branch"},
+        ("github", "create_repository"): {"name", "org"},
+        ("github", "delete_file"): {"owner", "repo", "branch", "path"},
+        ("spotify", "spotify_add_tracks"): {"playlist_id", "uris"},
+        ("spotify", "spotify_create_playlist"): {"name"},
+    }
+    for (server, action), keys in expected.items():
+        data = tomllib.loads((TOOL_DIR / f"{server}.toml").read_text())
+        tool = next(t for t in data["tool"] if t["name"] == action)
+        assert set(tool.get("identity", [])) == keys, (
+            f"{server}:{action} identity drifted from the pin"
+        )
+
+
+def test_identity_declared_only_on_gated_tools():
+    """identity without confirm is dead policy — the gate never reads it."""
+    for path in _tomls():
+        for tool in tomllib.loads(path.read_text()).get("tool", []):
+            if tool.get("identity"):
+                assert tool.get("confirm"), (
+                    f"{path.stem}:{tool['name']} declares identity but is "
+                    f"not confirm-gated"
+                )
+
+
 def test_registry_matches_tomls():
     registry = set(json.loads(SERVERS_JSON.read_text())["mcpServers"])
     assert registry == {p.stem for p in _tomls()}

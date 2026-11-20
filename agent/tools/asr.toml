@@ -9,7 +9,7 @@ name = "asr"
 
 [[tool]]
 name = "enroll"
-description = "Add a speech segment to the owner's voiceprint. For agent/enroll_voice.py only — the LLM cannot supply audio."
+description = "Add a speech segment to the owner's voiceprint. For voice/enroll_voice.py only — the LLM cannot supply audio."
 enabled = false
 
 [[tool]]

@@ -8,18 +8,18 @@ a 3-layer LSTM (40 -> 256) with a linear projection, ~1.4 M parameters.
 This script (run on a machine that HAS resemblyzer + torch, e.g. the dev
 Mac) produces the two artifacts the RPi runtime needs:
 
-    models/voice_encoder.onnx   the LSTM encoder, ~6 MB, opset 17
-    models/mel_basis.npy        the 40 x 201 Slaney mel filterbank, 32 KB
+    voice/models/voice_encoder.onnx   the LSTM encoder, ~6 MB, opset 17
+    voice/models/mel_basis.npy        the 40 x 201 Slaney mel filterbank, 32 KB
 
-mcp/voice_encoder.py reimplements resemblyzer's preprocessing in pure numpy
+voice/voice_encoder.py reimplements resemblyzer's preprocessing in pure numpy
 and runs the ONNX model via onnxruntime (already a pipecat base dependency),
 so the RPi install drops torch entirely. Embeddings are numerically faithful
 to resemblyzer's — the enrolled voiceprint.json stays valid (verify with
 --verify, which needs resemblyzer present).
 
 Usage:
-    .venv/bin/python tools/export_voice_encoder.py            # export
-    .venv/bin/python tools/export_voice_encoder.py --verify   # export + check
+    .venv/bin/python voice/export_voice_encoder.py            # export
+    .venv/bin/python voice/export_voice_encoder.py --verify   # export + check
                                                               # against resemblyzer
 """
 
@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 _ROOT = Path(__file__).resolve().parents[1]
-_MODELS = _ROOT / "models"
+_MODELS = _ROOT / "voice" / "models"
 _ONNX_PATH = _MODELS / "voice_encoder.onnx"
 _MEL_PATH = _MODELS / "mel_basis.npy"
 
@@ -98,7 +98,7 @@ def verify() -> None:
     import json
     import wave
 
-    sys.path.insert(0, str(_ROOT / "mcp"))
+    sys.path.insert(0, str(_ROOT / "voice"))
     from voice_encoder import OnnxVoiceEncoder
 
     from resemblyzer import VoiceEncoder, preprocess_wav

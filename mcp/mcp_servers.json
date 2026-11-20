@@ -24,7 +24,7 @@
       "type": "http",
       "url": "https://spotify-mcp.charrienacor.workers.dev/mcp",
       "headers": {
-        "Authorization": "Bearer ${SPOTIFY_ACCESS_TOKEN}"
+        "Authorization": "Bearer ${SPOTIFY_API_KEY}"
       }
     },
     "tavily": {

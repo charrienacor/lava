@@ -1,6 +1,8 @@
 # Tools exposed by the 'spotify' MCP server (15 found).
 # Flip `enabled` to choose what the LLM sees; `confirm = true` requires spoken
-# user approval before the gateway runs the tool (see tool_gateway.py).
+# user approval before the gateway runs the tool; `identity = [...]` names the
+# arguments that approval binds to — every other argument is payload and rides
+# along after a "yes" (see tool_gateway.py).
 # Playback controls stay exempt: the user just asked for them out loud.
 # Read directly at startup.
 
@@ -12,12 +14,14 @@ name = "spotify_add_tracks"
 description = "Add tracks (by URI, e.g. spotify:track:...) to a playlist. Up to 100 per call."
 enabled = true
 confirm = true
+identity = ["playlist_id", "uris"]
 
 [[tool]]
 name = "spotify_create_playlist"
 description = "Create a new playlist in the connected Spotify account and return its ID."
 enabled = true
 confirm = true
+identity = ["name"]
 
 [[tool]]
 name = "spotify_get_devices"

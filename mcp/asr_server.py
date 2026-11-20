@@ -9,7 +9,7 @@ Two tools:
   rejected voice for real silence. With no voiceprint yet the gate is
   fail-open, so the agent still works.
 - enroll: add a speech segment to the owner's voiceprint. Called 2-3 times
-  with different samples via agent/enroll_voice.py, never by the LLM (it
+  with different samples via voice/enroll_voice.py, never by the LLM (it
   cannot supply audio).
 
 The voiceprint is labeled with the user's name from data/profile.yaml.
@@ -43,11 +43,12 @@ from groq import (  # noqa: E402
 from loguru import logger  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
-# The gate's encoder is a sibling module: the resemblyzer weights exported to
-# ONNX + numpy preprocessing — no torch on the RPi (see voice_encoder.py).
-# asr_server.py is launched as a script from the project root, so its own
-# folder goes on sys.path to make that import work.
+# The gate's encoder lives in voice/ (the voiceprint bundle): the resemblyzer
+# weights exported to ONNX + numpy preprocessing — no torch on the RPi (see
+# voice/voice_encoder.py). asr_server.py is launched as a script from the
+# project root, so its own folder goes on sys.path; voice/ is added beside it.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "voice"))
 
 from voice_encoder import OnnxVoiceEncoder  # noqa: E402
 
@@ -81,7 +82,12 @@ VOICEPRINT_JSON = _ROOT / "data" / "voiceprint.json"
 # speakers <0.65; 0.75 is a middle value — validate with real voices and
 # override with ASR_SPEAKER_MIN_SIM if needed.
 MIN_SIMILARITY = float(os.environ.get("ASR_SPEAKER_MIN_SIM", "0.50"))
-ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-large-v3-turbo")
+# The transcription model is owned by .env (ASR_MODEL) — no code default:
+# a missing var fails loudly here instead of transcribing with a model the
+# agent side does not know about.
+ASR_MODEL = os.environ.get("ASR_MODEL", "")
+if not ASR_MODEL:
+    raise RuntimeError("ASR_MODEL is not set (add it to .env)")
 
 # The gate's reject marker, returned instead of a transcript. Deliberately
 # NOT "" — the empty string means "owner spoke, Whisper heard nothing" (real
@@ -192,7 +198,7 @@ def _embed(audio_b64: str, fmt: str = "wav") -> np.ndarray:
     """
     encoder = _get_encoder()
     if encoder is None:
-        raise RuntimeError("voice encoder unavailable (models/voice_encoder.onnx)")
+        raise RuntimeError("voice encoder unavailable (voice/models/voice_encoder.onnx)")
     wav, rate = _decode_wav(audio_b64, fmt)
     return encoder.embed_utterance(wav, source_sr=rate)
 
@@ -281,7 +287,7 @@ def transcribe(audio_b64: str, fmt: str = "wav") -> str:
         if not _warned_unenrolled:
             logger.warning(
                 "No voiceprint enrolled — speaker gating is OFF "
-                "(run agent/enroll_voice.py to enable it)"
+                "(run voice/enroll_voice.py to enable it)"
             )
             _warned_unenrolled = True
     elif encoder is None:

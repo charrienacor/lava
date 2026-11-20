@@ -1,7 +1,8 @@
-"""ASR — Groq Whisper (asr MCP server; model set there) via VAD segments."""
+"""ASR — Groq Whisper (asr MCP server; model from ASR_MODEL in .env) via VAD segments."""
 
 import asyncio
 import base64
+import os
 from typing import AsyncGenerator
 
 from loguru import logger
@@ -42,7 +43,7 @@ class VoiceNotRecognizedFrame(ControlFrame):
 
 
 class McpWhisperSTTService(SegmentedSTTService):
-    """Groq Whisper via the asr MCP server (model chosen there).
+    """Groq Whisper via the asr MCP server (model = ASR_MODEL from .env).
 
     SegmentedSTTService buffers audio per VAD speech segment, resamples it to
     16 kHz, wraps it in a WAV container, and calls ``run_stt`` on a background
@@ -57,13 +58,19 @@ class McpWhisperSTTService(SegmentedSTTService):
     """
 
     def __init__(self, *, mcp: MCPClient, **kwargs):
+        model = os.environ.get("ASR_MODEL")
+        if not model:
+            raise RuntimeError("ASR_MODEL is not set (add it to .env)")
         super().__init__(
             ttfs_p99_latency=1.0,
             # All fields given: pipecat validates the settings at service
             # start and errors on NOT_GIVEN leftovers. The model string is
             # display only (synthesis happens in the asr MCP server, which
-            # pins its own model); language is fixed to English there too.
-            settings=STTSettings(model="whisper-large-v3-turbo", language="en"),
+            # reads the same required ASR_MODEL); language is fixed to
+            # English there too. No default on purpose: the model is owned
+            # by .env alone, and a missing var must fail loudly rather than
+            # let the display drift from what the server transcribes with.
+            settings=STTSettings(model=model, language="en"),
             **kwargs,
         )
         self._mcp = mcp

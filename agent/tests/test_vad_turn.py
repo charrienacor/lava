@@ -2,7 +2,6 @@
 
 import asyncio
 
-import pytest
 from pipecat.audio.turn.smart_turn.base_smart_turn import EndOfTurnState
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.frames.frames import TranscriptionFrame

@@ -35,11 +35,36 @@ _ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 # Per-server tool schemas captured at connect (see
 # connect_mcp_clients_report): {server: {tool: {"required": [...],
-# "properties": [...]}}}. The tool gateway reads these to advertise EXACT
-# argument names per action — with the full schemas hidden (progressive
-# disclosure), the model was guessing (uri vs track_uri, uris lists) and
-# burning turns on validation errors.
+# "properties": [...], "enums": {param: [values]}}}}. The tool gateway
+# reads these to advertise EXACT argument names per action — with the full
+# schemas hidden (progressive disclosure), the model was guessing (uri vs
+# track_uri, uris lists) and burning turns on validation errors. Enum
+# values ride along for enum-valued params (tavily's time_range:
+# day/week/month/year, search_depth, topic): a name alone leaves the
+# model inventing values like "recent", which the server then rejects.
 SERVER_TOOL_SCHEMAS: dict[str, dict[str, dict]] = {}
+
+
+def _param_enums(properties: dict | None) -> dict[str, list[str]]:
+    """Compact enum values per parameter, for the gateway's arg hints.
+
+    Only small enums (≤6 values) are kept: the point is to stop the model
+    from guessing illegal values, not to republish full schemas. Nullable
+    params wrap their enum in anyOf; the first wrapped enum wins.
+    """
+    enums: dict[str, list[str]] = {}
+    for pname, spec in (properties or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        values = spec.get("enum")
+        if not values:
+            for sub in spec.get("anyOf") or []:
+                if isinstance(sub, dict) and sub.get("enum"):
+                    values = sub["enum"]
+                    break
+        if values and len(values) <= 6:
+            enums[str(pname)] = [str(v) for v in values]
+    return enums
 
 # Live per-server reachability for the web tray's health dot. True/False
 # from the last definitive contact — the startup connect or the most recent
@@ -245,6 +270,7 @@ async def ensure_server_schema(name: str, client: MCPClient) -> bool:
         t.name: {
             "required": list(t.required or []),
             "properties": sorted((t.properties or {}).keys()),
+            "enums": _param_enums(t.properties),
         }
         for t in result.standard_tools
     }
@@ -299,6 +325,7 @@ async def connect_mcp_clients_report(
             t.name: {
                 "required": list(t.required or []),
                 "properties": sorted((t.properties or {}).keys()),
+                "enums": _param_enums(t.properties),
             }
             for t in result.standard_tools
         }

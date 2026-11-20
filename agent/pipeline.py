@@ -76,8 +76,8 @@ AUDIO_OUT_SAMPLE_RATE = 24000
 BRIDGE_SERVERS = {"asr", "tts"}
 
 # Heavyweight servers hidden behind ONE generic tool each (tool_gateway.py):
-# Groq's free tier is 8,000 tokens/minute, and github's 15 full definitions
-# alone cost ~5,600. Every capability server sends a compact TOML-generated
+# Groq's free tier is 8,000 tokens/minute, and github's full definitions
+# alone cost ~2,540. Every capability server sends a compact TOML-generated
 # index instead; asr/tts stay bridge-excluded (BRIDGE_SERVERS). Remove a
 # server from this set to expose its full tool definitions again.
 GATEWAY_SERVERS = {"github", "tavily", "time", "spotify"}
@@ -94,10 +94,11 @@ def input_filter():
 
     RNNoise runs at 48 kHz, so every 16 kHz mic frame is resampled up and
     back down around it — a steady CPU cost on the Pi's four cores, which
-    Silero, SmartTurn, the speaker gate and Piper all compete for. The
-    browser client already applies WebRTC noise suppression
-    (ui/static/app.js getUserMedia), so on that path RNNOISE=0 drops the
-    duplicate work. Keep it on for raw mics (the RPi local client).
+    Silero, SmartTurn, the speaker gate and Piper all compete for. Browser
+    tabs denoise themselves (getUserMedia noiseSuppression) and skip this
+    by connecting with ?dn=0 (ui/server.py /ws handler — no env change
+    needed); RNNOISE=0 stays the global kill switch. Keep RNNoise on for
+    raw mics (the RPi local client, ui/pi_client.py).
     """
     if os.environ.get("RNNOISE", "1") in ("0", "false", "no"):
         return None

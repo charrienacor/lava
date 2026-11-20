@@ -12,8 +12,9 @@ import pytest
 
 def test_catalogue_flags():
     gh = dict((n, c) for n, _, c in _catalogue("github"))
-    assert len(gh) == 9
+    assert len(gh) == 10
     assert gh["merge_pull_request"] and gh["push_files"]
+    assert gh["delete_file"]  # destructive: gated like the other writers
     assert not gh["search_repositories"]
     assert not gh["get_me"]  # read-only profile lookup, no gate
     sp = dict((n, c) for n, _, c in _catalogue("spotify"))
@@ -31,8 +32,67 @@ def test_schema_shape():
     action = d["parameters"]["properties"]["action"]
     assert "enum" not in action
     assert "merge_pull_request" in d["description"]
-    assert "delete_file" not in d["description"]
+    assert "delete_file" in d["description"]  # enabled policy: advertised
     assert "confirmed" in d["parameters"]["properties"]
+
+
+def test_schema_arg_hints_show_live_enums(monkeypatch):
+    """Enum-valued params advertise their VALUES, not just names.
+
+    With only names visible the model invents values ("time_range":
+    "recent") and burns a turn on the server's rejection — the values are
+    captured live from the server's schema (mcp_client._param_enums).
+    """
+    monkeypatch.setattr(
+        tool_gateway, "SERVER_TOOL_SCHEMAS",
+        {"tavily": {"tavily_search": {
+            "required": ["query"],
+            "properties": [
+                "query", "topic", "time_range", "max_results",
+                "include_images", "include_raw_content",
+            ],
+            "enums": {
+                "topic": ["general", "news"],
+                "time_range": ["day", "week", "month", "year"],
+            },
+        }}},
+    )
+    schema = _schema("tavily", [("tavily_search", "Search the web.", False)])
+    d = schema.to_default_dict()
+    assert "topic(general|news)" in d["description"]
+    assert "time_range(day|week|month|year)" in d["description"]
+    assert "query*" in d["description"]
+    assert "max_results" in d["description"]
+    assert "max_results(" not in d["description"]  # no enum -> no parens
+    # include_* display toggles stay off the wire (token economy; naming
+    # include_raw_content invites multi-k raw dumps into an 8k-TPM context)
+    assert "include_images" not in d["description"]
+    assert "include_raw_content" not in d["description"]
+
+
+def test_catalogue_advertises_operating_knowledge():
+    """The gateway advertises each action's FIRST description sentence, so
+    multi-step flows must live THERE — not in the system prompt. Pinned:
+    the github.io personal-site route (with the autoInit detail that makes
+    push_files work on a fresh repo) and tavily's recency params."""
+    gh = {n: s for n, s, _ in _catalogue("github")}
+    assert ".github.io" in gh["get_me"] and "FIRST" in gh["get_me"]
+    assert "autoInit" in gh["create_repository"]
+    assert ".github.io" in gh["create_repository"]
+    assert ".github.io" in gh["push_files"] and "raw text" in gh["push_files"]
+    assert "user:<login>" in gh["search_repositories"]
+    tv = {n: s for n, s, _ in _catalogue("tavily")}
+    # tavily stays AS SHIPPED: the summary line is the stock description —
+    # no extra prose. Recency params ride the LIVE enum hints
+    # (test_schema_arg_hints_show_live_enums), and the search-first rule
+    # lives in prompt.py's short awareness block — neither is "prompt
+    # coaching" on the tool itself.
+    assert tv["tavily_search"] == "Search the web for current information on any topic."
+    assert tv["tavily_extract"] == "Extract content from URLs."
+    # every advertised line stays within the cap (no mid-word truncation)
+    for server in ("github", "tavily", "spotify", "time"):
+        for _, summary, _ in _catalogue(server):
+            assert len(summary) <= tool_gateway._CATALOGUE_MAX_DESC
 
 
 def test_identity_binding():
@@ -197,6 +257,39 @@ def test_ungated_runs_immediately_and_unknown_denied(gh_handler):
     assert "executed:search_repositories" in out
     assert "unknown action" in call(gh_handler, {"action": "banana",
                                                  "arguments": {}}, msgs)
+
+
+def test_tavily_capped_per_user_turn(monkeypatch):
+    """One question, at most PER_TURN_ACTION_CAPS searches: the measured
+    ladder (a rejected call re-issued with fixed arguments, a re-search
+    after weak snippets) ends in a terminal refusal that orders the model
+    to answer from what it has. A NEW user turn reopens the budget."""
+    async def fake_call(client, name, args, server=None):
+        return f"executed:{name}"
+
+    monkeypatch.setattr(tool_gateway, "call_mcp_tool", fake_call)
+    llm = FakeLLM()
+    asyncio.run(gateway_schemas(llm, {"tavily": object()}, {"tavily"}))
+    h = llm.fns["tavily"]
+    msgs = [{"role": "user", "content": "who won the midterms"}]
+    args = {"action": "tavily_search", "arguments": {"query": "x"}}
+
+    cap = tool_gateway.PER_TURN_ACTION_CAPS["tavily_search"]
+    for _ in range(cap):  # the ladder itself fits the budget
+        out = call(h, args, msgs)
+        assert "executed:tavily_search" in out and "<tool_result" in out
+    # one past the cap: terminal, unframed, nothing executed
+    out = call(h, args, msgs)
+    assert "already run" in out and "<tool_result" not in out
+    assert "results you already have" in out
+    # the user spoke again: budget reopens
+    msgs.append({"role": "user", "content": "and the senate?"})
+    out = call(h, args, msgs)
+    assert "executed:tavily_search" in out
+    # uncapped actions (e.g. tavily_extract) are untouched
+    out = call(h, {"action": "tavily_extract",
+                   "arguments": {"urls": ["https://x"]}}, msgs)
+    assert "executed:tavily_extract" in out
 
 
 def test_disabled_tool_is_recognized_and_live_flips(monkeypatch, tmp_path):

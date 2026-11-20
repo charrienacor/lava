@@ -2,6 +2,11 @@
 
 // ---------------- state ----------------
 const SR_IN = 16000;
+// ?view=1 — spectator: watch the session the Pi's mic owns (ui/pi_client.py
+// speaks /ws from the Pi's hardware). Same rendering as the owner's page,
+// but the socket is /ws/view, no mic starts, nothing is ever sent, and the
+// orb is not a button.
+const VIEWER = new URLSearchParams(location.search).has("view");
 let ws = null;
 let audioCtx = null;
 let mediaStream = null;
@@ -424,6 +429,12 @@ function setState(s) {
   } else {
     stateLabel.classList.remove("hide");
     stateLabel.textContent = s;
+  }
+  if (VIEWER) {
+    // Spectator: the mic — and the conversation — live on the Pi.
+    stateLabel.textContent = s === "idle" ? "watching · talk near the Pi"
+      : s === "listening" ? "listening on the Pi" : s;
+    orbWrap.setAttribute("aria-label", "Watching Lava — speak near the Pi");
   }
 }
 setState("idle");
@@ -873,6 +884,146 @@ function toastShow(m) {
   else toastSetState(rec, "spin", m.sub, null);
 }
 
+// The message handler shared by the owner's socket (connect) and the
+// spectator's (connectViewer): ev.target is the socket that delivered the
+// frame; everything else goes through the ws global.
+function handleServerMessage(ev) {
+  if (!ws || ev.target !== ws) return;
+  // Binary frames are bot audio: uint16 LE sample rate + 16-bit LE mono PCM.
+  if (ev.data instanceof ArrayBuffer) {
+    if (!heardVoice) { heardVoice = true; playConfirmBeep(); }
+    const sr = new DataView(ev.data).getUint16(0, true);
+    enqueueAudio(new Int16Array(ev.data, 2), sr);
+    return;
+  }
+  const m = JSON.parse(ev.data);
+  if (m.type === "busy") {
+    // Another device owns the session: stop retrying, say so plainly.
+    running = false;
+    reconnectTries = 0;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connPhase = "offline";
+    stopMic();
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    orbWrap.setAttribute("aria-label", "Start talking to Lava");
+    stateLabel.textContent = "in use on another device";
+    stateLabel.classList.remove("hide");
+  } else if (m.type === "duck") {
+    duckBot(true);
+  } else if (m.type === "unduck") {
+    duckBot(false);
+  } else if (m.type === "barge") {
+    // Server detected user speech while the bot was talking - cut the
+    // remaining audio right now (the Pi pipeline behaves the same way).
+    stopBotAudio();
+    finalizeBotRow();
+    setState("listening");
+  } else if (m.type === "processing") {
+    // The bridge has the utterance and is transcribing: switch to
+    // "thinking" now instead of sitting on "listening" while a slow ASR
+    // round trip runs (the orb looked deaf). Guarded by botPlaying: a
+    // backchannel over the bot must not flicker the state away from
+    // "speaking" (the bot keeps talking in that case).
+    if (running && !botPlaying) setState("thinking");
+  } else if (m.type === "timer") {
+    // A timer/reminder came due: the announcement arrives as normal
+    // speech (text/done events), this toast just names what fired.
+    toastShow({
+      type: "tool_done", key: "timer:" + (m.id || m.label || m.kind),
+      cat: "timer", title: m.kind === "reminder" ? "Reminder" : "Timer",
+      sub: m.label || "done"
+    });
+  } else if (m.type === "toast") {
+    // Server-initiated notice (rate limits, …) in the tool tray; the
+    // server throttles repeats, the tray dedupes by key.
+    toastShow({
+      type: "tool_done", key: m.key, cat: m.cat,
+      title: m.title, sub: m.sub
+    });
+    setTimeout(() => toastDismiss(m.key), 6000);
+  } else if (m.type === "voice_enrolled") {
+    toastShow({
+      type: "tool_done", key: "voice", cat: "system",
+      title: "Voice enrolled", sub: "only your voice starts turns now"
+    });
+  } else if (m.type === "voice_rejected") {
+    // Someone (or something) else spoke: the utterance was dropped
+    // before it could become a turn. One shared toast key, so repeats
+    // refresh it instead of stacking.
+    toastShow({
+      type: "tool_done", key: "voice", cat: "system",
+      title: "Unknown voice", sub: "ignored — not the enrolled voiceprint"
+    });
+  } else if (m.type === "mcp") {
+    // Live tool policy: a TOML allowlist changed on disk (or the connect
+    // push arrived). Re-render the tray; toast only on later updates.
+    renderMcpTray(m.servers);
+  } else if (m.type === "tool_start" || m.type === "tool_done") {
+    // Command notification: a tool is starting (spin) or finished
+    // (ok/err). The server already computed cat/title/sub/err.
+    toastShow(m);
+  } else if (m.type === "transcript") {
+    stopBotAudio();   // barge-in: user spoke over the agent
+    addUser(m.text);
+    setState("thinking");
+  } else if (m.type === "transcript_fix") {
+    // The proofread pass corrected a mis-hearing: update the user's last
+    // bubble in place (it was shown immediately, before the fix landed).
+    const rows = chat.querySelectorAll(".row.user");
+    const b = rows.length && rows[rows.length - 1].querySelector(".bubble");
+    if (b) b.textContent = m.text;
+  } else if (m.type === "text") {
+    ensureBotRow();
+    // Frames are sentence-sized; keep one space between sentences even
+    // when the upstream split dropped the boundary whitespace.
+    const prev = botBubble.textContent, t = m.t;
+    if (prev && /\S$/.test(prev) && /^\S/.test(t)) botBubble.textContent += " ";
+    botBubble.textContent += t;
+    chatFollow();
+  } else if (m.type === "done") {
+    // A turn with no reply AND no tool calls = the LLM SKIPped a TV/room
+    // fragment: leave no trace. But a run that CALLED a tool did real work
+    // (pipecat ends tool-call runs with an empty reply mid-turn) - the
+    // user's transcript and the command toast stay.
+    if (!m.reply && !m.tools) {
+      if (botRow) { botRow.remove(); botRow = null; botBubble = null; }
+      const rows = chat.querySelectorAll(".row.user");
+      if (rows.length) rows[rows.length - 1].remove();
+    }
+    finalizeBotRow();
+    // The turn is over, but queued audio may still be playing (the server
+    // pipelines TTS) - onended flips the state when playback truly ends.
+    if (running && !botPlaying) setState("listening");
+  } else if (m.type === "error") {
+    finalizeBotRow();
+    if (running && !botPlaying) setState("listening");
+  } else if (m.type === "silence") {
+    // Same guard as done/error: with a deferred overlap the bot may still
+    // be talking (the span was noise) - don't flip the orb out of speaking.
+    if (running && !botPlaying) setState("listening");
+  } else if (m.type === "bye") {
+    if (VIEWER) {
+      // The Pi's session timed out — the viewer socket stays open; keep
+      // watching for the next conversation.
+      stopBotAudio();
+      finalizeBotRow();
+      setState("idle");
+      return;
+    }
+    // Idle timeout: the server heard nothing and closed the session.
+    // Stop the mic quietly - no banner. The orb drops back down and the
+    // next tap resumes the same conversation (the server keeps it by cid).
+    running = false;
+    reconnectTries = 0;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connPhase = "offline";
+    stopMic();
+    stopBotAudio();
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    setState("idle");
+  }
+}
+
 // ---------------- websocket ----------------
 function connect() {
   // Never hold two sockets: drop any pending retry and any live socket.
@@ -881,7 +1032,12 @@ function connect() {
   const mySession = ++sessionId;
   connPhase = "retrying";  // concerned face while attempting
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const sock = new WebSocket(`${proto}://${location.host}/ws?cid=${encodeURIComponent(client_id)}`);
+  // dn=0: this page asks for WebRTC noise suppression in getUserMedia, so
+  // the session can skip the server-side RNNoise — duplicate denoising on
+  // the Pi's four cores, frame after frame. Raw-mic clients (pi_client.py)
+  // send no dn and keep the full front end.
+  const sock = new WebSocket(
+    `${proto}://${location.host}/ws?cid=${encodeURIComponent(client_id)}&dn=0`);
   ws = sock;
   sock.binaryType = "arraybuffer";
 
@@ -892,134 +1048,7 @@ function connect() {
     startMic(mySession);
   };
 
-  sock.onmessage = (ev) => {
-    if (sock !== ws) return;
-    // Binary frames are bot audio: uint16 LE sample rate + 16-bit LE mono PCM.
-    if (ev.data instanceof ArrayBuffer) {
-      if (!heardVoice) { heardVoice = true; playConfirmBeep(); }
-      const sr = new DataView(ev.data).getUint16(0, true);
-      enqueueAudio(new Int16Array(ev.data, 2), sr);
-      return;
-    }
-    const m = JSON.parse(ev.data);
-    if (m.type === "busy") {
-      // Another device owns the session: stop retrying, say so plainly.
-      running = false;
-      reconnectTries = 0;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      connPhase = "offline";
-      stopMic();
-      if (ws) { ws.onclose = null; ws.close(); ws = null; }
-      orbWrap.setAttribute("aria-label", "Start talking to Lava");
-      stateLabel.textContent = "in use on another device";
-      stateLabel.classList.remove("hide");
-    } else if (m.type === "duck") {
-      duckBot(true);
-    } else if (m.type === "unduck") {
-      duckBot(false);
-    } else if (m.type === "barge") {
-      // Server detected user speech while the bot was talking - cut the
-      // remaining audio right now (the Pi pipeline behaves the same way).
-      stopBotAudio();
-      finalizeBotRow();
-      setState("listening");
-    } else if (m.type === "processing") {
-      // The bridge has the utterance and is transcribing: switch to
-      // "thinking" now instead of sitting on "listening" while a slow ASR
-      // round trip runs (the orb looked deaf). Guarded by botPlaying: a
-      // backchannel over the bot must not flicker the state away from
-      // "speaking" (the bot keeps talking in that case).
-      if (running && !botPlaying) setState("thinking");
-    } else if (m.type === "timer") {
-      // A timer/reminder came due: the announcement arrives as normal
-      // speech (text/done events), this toast just names what fired.
-      toastShow({
-        type: "tool_done", key: "timer:" + (m.id || m.label || m.kind),
-        cat: "timer", title: m.kind === "reminder" ? "Reminder" : "Timer",
-        sub: m.label || "done"
-      });
-    } else if (m.type === "toast") {
-      // Server-initiated notice (rate limits, …) in the tool tray; the
-      // server throttles repeats, the tray dedupes by key.
-      toastShow({
-        type: "tool_done", key: m.key, cat: m.cat,
-        title: m.title, sub: m.sub
-      });
-      setTimeout(() => toastDismiss(m.key), 6000);
-    } else if (m.type === "voice_enrolled") {
-      toastShow({
-        type: "tool_done", key: "voice", cat: "system",
-        title: "Voice enrolled", sub: "only your voice starts turns now"
-      });
-    } else if (m.type === "voice_rejected") {
-      // Someone (or something) else spoke: the utterance was dropped
-      // before it could become a turn. One shared toast key, so repeats
-      // refresh it instead of stacking.
-      toastShow({
-        type: "tool_done", key: "voice", cat: "system",
-        title: "Unknown voice", sub: "ignored — not the enrolled voiceprint"
-      });
-    } else if (m.type === "mcp") {
-      // Live tool policy: a TOML allowlist changed on disk (or the connect
-      // push arrived). Re-render the tray; toast only on later updates.
-      renderMcpTray(m.servers);
-    } else if (m.type === "tool_start" || m.type === "tool_done") {
-      // Command notification: a tool is starting (spin) or finished
-      // (ok/err). The server already computed cat/title/sub/err.
-      toastShow(m);
-    } else if (m.type === "transcript") {
-      stopBotAudio();   // barge-in: user spoke over the agent
-      addUser(m.text);
-      setState("thinking");
-    } else if (m.type === "transcript_fix") {
-      // The proofread pass corrected a mis-hearing: update the user's last
-      // bubble in place (it was shown immediately, before the fix landed).
-      const rows = chat.querySelectorAll(".row.user");
-      const b = rows.length && rows[rows.length - 1].querySelector(".bubble");
-      if (b) b.textContent = m.text;
-    } else if (m.type === "text") {
-      ensureBotRow();
-      // Frames are sentence-sized; keep one space between sentences even
-      // when the upstream split dropped the boundary whitespace.
-      const prev = botBubble.textContent, t = m.t;
-      if (prev && /\S$/.test(prev) && /^\S/.test(t)) botBubble.textContent += " ";
-      botBubble.textContent += t;
-      chatFollow();
-    } else if (m.type === "done") {
-      // A turn with no reply AND no tool calls = the LLM SKIPped a TV/room
-      // fragment: leave no trace. But a run that CALLED a tool did real work
-      // (pipecat ends tool-call runs with an empty reply mid-turn) - the
-      // user's transcript and the command toast stay.
-      if (!m.reply && !m.tools) {
-        if (botRow) { botRow.remove(); botRow = null; botBubble = null; }
-        const rows = chat.querySelectorAll(".row.user");
-        if (rows.length) rows[rows.length - 1].remove();
-      }
-      finalizeBotRow();
-      // The turn is over, but queued audio may still be playing (the server
-      // pipelines TTS) - onended flips the state when playback truly ends.
-      if (running && !botPlaying) setState("listening");
-    } else if (m.type === "error") {
-      finalizeBotRow();
-      if (running && !botPlaying) setState("listening");
-    } else if (m.type === "silence") {
-      // Same guard as done/error: with a deferred overlap the bot may still
-      // be talking (the span was noise) - don't flip the orb out of speaking.
-      if (running && !botPlaying) setState("listening");
-    } else if (m.type === "bye") {
-      // Idle timeout: the server heard nothing and closed the session.
-      // Stop the mic quietly - no banner. The orb drops back down and the
-      // next tap resumes the same conversation (the server keeps it by cid).
-      running = false;
-      reconnectTries = 0;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      connPhase = "offline";
-      stopMic();
-      stopBotAudio();
-      if (ws) { ws.onclose = null; ws.close(); ws = null; }
-      setState("idle");
-    }
-  };
+  sock.onmessage = handleServerMessage;
 
   sock.onclose = () => {
     if (sock !== ws) return;  // a superseded socket closing: ignore
@@ -1270,6 +1299,7 @@ function stopMic() {
 
 // ---------------- toggle ----------------
 orbWrap.addEventListener("click", () => {
+  if (VIEWER) return;  // nothing to own here; any tap already re-arms audio
   if (!running) {
     // A retry timer, a still-connecting socket, or a socket waiting on the
     // mic prompt means connection work is already in flight: a tap cancels
@@ -1452,6 +1482,14 @@ mcpTrayPanel.addEventListener("click", (e) => {
 });
 
 function askLava(text) {
+  if (VIEWER) {
+    toastShow({
+      key: "viewer-readonly", cat: "viewer", title: "View-only page",
+      sub: "Talk near the Pi's mic instead"
+    });
+    setTimeout(() => toastDismiss("viewer-readonly"), 4000);
+    return;
+  }
   if (!text) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     toastShow({
@@ -1478,3 +1516,49 @@ document.addEventListener("keydown", (e) => {
     setMcpTrayOpen(false);
   }
 });
+
+// ---------------- viewer mode (?view=1) ----------------
+// The laptop half of "Pi mic, laptop UI": ui/pi_client.py owns the voice on
+// the Pi, this page only watches. Same rendering path as the owner's session
+// (handleServerMessage), different socket: /ws/view receives every event and
+// reply audio but accepts nothing. AudioContext autoplay rules still apply —
+// the first tap anywhere (the pointerdown listener) re-arms audio, and the
+// sound banner asks for that tap when a reply arrives before one.
+function connectViewer() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { ws.onclose = null; try { ws.close(); } catch (e) { } ws = null; }
+  connPhase = "retrying";
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const sock = new WebSocket(`${proto}://${location.host}/ws/view`);
+  ws = sock;
+  sock.binaryType = "arraybuffer";
+
+  sock.onopen = () => {
+    if (sock !== ws) return;
+    reconnectTries = 0;
+    connPhase = "online";
+    running = true;  // the state machine's "session live" flag — no mic rides on it
+    setState("listening");
+  };
+  sock.onmessage = handleServerMessage;
+  sock.onclose = () => {
+    if (sock !== ws) return;
+    ws = null;
+    running = false;
+    stopBotAudio();
+    setState("idle");
+    // The server may be restarting: keep watching, like the owner's retry loop.
+    if (reconnectTries < 20) {
+      reconnectTries += 1;
+      connPhase = "retrying";
+      stateLabel.textContent = "reconnecting";
+      stateLabel.classList.remove("hide");
+      reconnectTimer = setTimeout(connectViewer, 2000);
+    } else {
+      connPhase = "offline";
+    }
+  };
+  sock.onerror = () => { try { sock.close(); } catch (e) { } };
+}
+
+if (VIEWER) connectViewer();

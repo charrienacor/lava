@@ -1,7 +1,7 @@
 """Progressive disclosure + enforced confirm gate for MCP capability servers.
 
-Groq's free tier allows 8,000 tokens per MINUTE. Full definitions for the 15
-enabled GitHub tools cost ~5,600 tokens of that on every single request. This
+Groq's free tier allows 8,000 tokens per MINUTE. The enabled GitHub tools'
+full definitions cost ~2,540 tokens of that on every single request. This
 module hides a wrapped server behind ONE generic tool whose definition is a
 compact index — one line per action, generated from the same TOML allowlist —
 and forwards calls to the real MCP server over its existing session. The
@@ -19,13 +19,14 @@ auto-summarizer compresses old turns (the count shrinks and a count recorded
 before a summarize could never be surpassed again). Using both covers each
 other's blind spot.
 
-Once an approval lands, the TARGET (repo/PR/file/playlist/tracks — see
-_IDENTITY_KEYS) is granted for the rest of the session: same-target repeats
-(iterating on the just-approved page) skip the handshake entirely, while a
-different target is a new fingerprint and asks again. Fingerprints are
-NORMALIZED (stringified, sorted lists, `confirmed` stripped) so cosmetic drift
-between the ask and the re-call does not look like a new target. Actions
-without an identity mapping fall back to full (normalized) arguments.
+Once an approval lands, the TARGET (repo/PR/file/playlist/tracks — the
+TOMLs' `identity = [...]` keys) is granted for the rest of the session:
+same-target repeats (iterating on the just-approved page) skip the
+handshake entirely, while a different target is a new fingerprint and
+asks again. Fingerprints are NORMALIZED (stringified, sorted lists,
+`confirmed` stripped) so cosmetic drift between the ask and the re-call
+does not look like a new target. Actions without an identity mapping
+fall back to full (normalized) arguments.
 
 Loop prevention (what was measured and what fixes it):
 
@@ -50,9 +51,9 @@ the counters; the caps are per session.
 Design: the guards are data; the gateway is the only stateful piece.
 
     policy source     the TOMLs, re-read on every call (live policy)
-    policy tables     identity keys, patience caps
+    policy tables     per-action identity keys (TOML `identity`), patience caps
     per-session state SessionState + _Call (fresh per session)
-    guards            deny / validate / strikeout / breaker / confirm gate
+    guards            deny / validate / strikeout / breaker / confirm / cap
     ServerGateway     owns client + state; handle() = guards → call → frame
     gateway_schemas   entry point: register one gateway per wrapped server
 """
@@ -60,6 +61,7 @@ Design: the guards are data; the gateway is the only stateful piece.
 import asyncio
 import json
 import re
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,6 +91,21 @@ _BACKGROUND: set[asyncio.Future] = set()  # late captures: keep a reference
 # no reconnect, no restart. The largest TOML parses in ~1 ms, noise next
 # to a tool call.
 
+# The one-line summary each action gets in the gateway index. Only
+# ENABLED actions are advertised, so a longer line is affordable: it buys
+# real operating knowledge per action (the <login>.github.io site route,
+# tavily's recency params) for ~40 chars ≈ 10 tokens each — the github
+# index grows ~504 → ~600 tokens, well inside the 8k TPM budget.
+_CATALOGUE_MAX_DESC = 170
+
+
+def _first_sentence(desc: str) -> str:
+    """The description's first sentence — the model-visible line."""
+    first = re.split(r"(?<=[.!?])\s", desc, maxsplit=1)[0]
+    if len(first) > _CATALOGUE_MAX_DESC:
+        first = first[:_CATALOGUE_MAX_DESC - 3].rstrip() + "..."
+    return first
+
 
 def _catalogue(server: str) -> list[tuple[str, str, bool]]:
     """(action, one-line summary, confirm?) for every enabled tool of a server.
@@ -106,10 +123,7 @@ def _catalogue(server: str) -> list[tuple[str, str, bool]]:
         if not tool.get("enabled"):
             continue
         desc = tool.get("description", "").strip()
-        first = re.split(r"(?<=[.!?])\s", desc, maxsplit=1)[0]
-        if len(first) > 110:
-            first = first[:107].rstrip() + "..."
-        entries.append((tool["name"], first, bool(tool.get("confirm"))))
+        entries.append((tool["name"], _first_sentence(desc), bool(tool.get("confirm"))))
     return entries
 
 
@@ -128,10 +142,7 @@ def _known_tools(server: str) -> dict[str, str]:
     known = {}
     for tool in data.get("tool", []):
         desc = tool.get("description", "").strip()
-        first = re.split(r"(?<=[.!?])\s", desc, maxsplit=1)[0]
-        if len(first) > 110:
-            first = first[:107].rstrip() + "..."
-        known[tool.get("name", "")] = first
+        known[tool.get("name", "")] = _first_sentence(desc)
     return known
 
 
@@ -161,8 +172,25 @@ def _schema(server: str, catalogue: list[tuple[str, str, bool]]) -> FunctionSche
         if not info:
             continue
         required = set(info.get("required") or [])
+        enums = info.get("enums") or {}
+
+        def _advertised(p):
+            # include_* display toggles stay off the wire: the model never
+            # needs them, and naming include_raw_content invites multi-k
+            # raw dumps into an 8k-TPM context. Required/enum params are
+            # always kept.
+            return p in required or p in enums or not p.startswith("include_")
+
+        def _render(p):
+            label = f"{p}*" if p in required else p
+            values = enums.get(p)
+            # Live enum values from the captured schema: with only names
+            # advertised, the model invents values ("time_range":
+            # "recent") and burns a turn on the server's rejection.
+            return f"{label}({'|'.join(values)})" if values else label
+
         args = ", ".join(
-            f"{p}*" if p in required else p for p in info.get("properties") or []
+            _render(p) for p in info.get("properties") or [] if _advertised(p)
         )
         if args:
             arg_lines.append(f"- {action}: {args}")
@@ -268,28 +296,43 @@ def _truthy(value: Any) -> bool:
 
 # ---- Protected-action policy: identity binding, patience -------------------
 
-# The identity of a protected call: which resource it touches. Free-text
-# payload keys (title, body, content, ...) are deliberately excluded, so
-# wording tweaks after a spoken "yes" ride along; a different target —
-# another PR, file, playlist or track list — is a new action needing new
-# approval. Actions missing from this map fall back to full arguments.
-_IDENTITY_KEYS = {
-    "github": {
-        "merge_pull_request": ("owner", "repo", "pullNumber"),
-        "create_or_update_file": ("owner", "repo", "branch", "path"),
-        "push_files": ("owner", "repo", "branch"),
-        "create_repository": ("name", "org"),
-    },
-    "spotify": {
-        "spotify_add_tracks": ("playlist_id", "uris"),
-        "spotify_create_playlist": ("name",),
-    },
-}
+def _identity_keys(server: str) -> dict[str, tuple[str, ...]]:
+    """Per-action target keys for the confirm gate, from the TOML policy.
+
+    ``identity = [...]`` on a ``[[tool]]`` names the arguments a spoken
+    "yes" binds to (github.toml, spotify.toml); every other argument is
+    payload — wording tweaks ride along after approval, a different
+    target is a new fingerprint and asks again. Read live like the rest
+    of tool policy: an identity edit applies to the running session's
+    next call, no restart.
+
+    A missing TOML, unreadable file, or tool without ``identity`` just
+    means no mapping: gated actions fall back to strict full-args
+    fingerprints (safe — more re-asking, never less protection).
+    """
+    try:
+        with open(TOOL_DIR / f"{server}.toml", "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return {
+        t["name"]: tuple(t["identity"])
+        for t in data.get("tool", [])
+        if t.get("name") and isinstance(t.get("identity"), list)
+    }
 
 # Patience caps (see module docstring). Terminal results tell the model to
 # stop and speak plainly; they reset on success or a new session.
 MAX_ASKS_PER_TARGET = 2  # approval rounds per target before terminal refusal
 MAX_ACTION_FAILS = 3  # failed calls per action per session before terminal
+
+# Per-turn call caps: reflexive re-calls inside ONE user turn burn seconds
+# of silence (measured: one midterms answer = 3 tavily_search calls, two
+# of them 400-fix retries; weak snippets invite re-searches too). Guards
+# are data: after this many runs of the same action with no new user turn
+# in between, the call is refused terminally — answer from the results
+# already in hand. A new user turn resets the budget.
+PER_TURN_ACTION_CAPS = {"tavily_search": 3}
 
 
 def _norm(value: Any) -> Any:
@@ -315,7 +358,7 @@ def _identity(server: str, action: str, args: dict[str, Any]) -> str:
     is stripped defensively so it can never leak into the identity.
     """
     args = {k: v for k, v in args.items() if k != "confirmed"}
-    keys = _IDENTITY_KEYS.get(server, {}).get(action)
+    keys = _identity_keys(server).get(action)
     if keys is None:  # unmapped gated action: stay strict, but normalized
         identity = dict(args)
     else:
@@ -364,6 +407,10 @@ class SessionState:
     # fingerprint -> newest user message text at terminal refusal
     strike_blocked: dict[str, str] = field(default_factory=dict)
     # action -> newest user message text at terminal refusal
+    action_calls: dict[str, int] = field(default_factory=dict)
+    # action -> calls run within the CURRENT user turn (per-turn caps)
+    action_anchor: tuple[str, int] | None = None
+    # (newest user text, turn count) when the current turn's budget opened
 
 
 @dataclass
@@ -579,17 +626,66 @@ def _circuit_breaker(
     return None
 
 
+def _per_turn_cap(
+    gw: "ServerGateway", params, call: _Call
+) -> str | None:
+    """Terminal refusal once an action ran PER_TURN_ACTION_CAPS times
+    inside ONE user turn — None to proceed (and count the call).
+
+    The rungs of the measured ladder each cost the user a second of
+    silence: a rejected call re-issued with fixed arguments, a re-search
+    after weak snippets. Guards are data, not prompt coaching — the cap
+    stops the ladder and orders the model to answer from what it has.
+    Runs LAST (after the confirm gate) so it counts only calls that
+    actually execute; the budget reopens on a new user turn, anchored on
+    the same (text, count) pair the confirm gate uses, so summarization
+    cannot wedge it.
+    """
+    cap = PER_TURN_ACTION_CAPS.get(call.action)
+    if cap is None:
+        return None
+    anchor = _user_anchor(params)
+    if anchor != gw.state.action_anchor:
+        gw.state.action_anchor = anchor
+        gw.state.action_calls = {}  # new user turn: budget reopens
+    made = gw.state.action_calls.get(call.action, 0)
+    if made < cap:
+        gw.state.action_calls[call.action] = made + 1
+        return None
+    return (
+        f"'{call.action}' has already run {cap} times this turn. Do not "
+        f"call it again. Answer from the results you already have, or "
+        f"tell the user plainly what is missing."
+    )
+
+
 # ---- Execution and framing --------------------------------------------------
 
 
 async def _run_tool(
     client: MCPClient, server: str, action: str, call_args: dict[str, Any]
 ) -> str:
-    """One real MCP call; any failure becomes an 'Error: …' tool result."""
+    """One real MCP call; any failure becomes an 'Error: …' tool result.
+
+    Every call logs its wall time: "tool tavily.tavily_search: 930 ms".
+    That line is the ground truth for tool latency questions — measured
+    against the LLM round trips around it, a searched answer's wait is
+    almost never the search itself (tavily's engine reported 0.13 s on a
+    turn whose retry ladder cost ~3.5 s in LLM re-fixes).
+    """
+    t0 = time.monotonic()
     try:
-        return await call_mcp_tool(client, action, call_args, server=server)
+        result = await call_mcp_tool(client, action, call_args, server=server)
     except Exception as e:
+        logger.warning(
+            f"tool {server}.{action} FAILED after "
+            f"{(time.monotonic() - t0) * 1000:.0f} ms: {e}"
+        )
         return f"Error: {e}"
+    took_s = time.monotonic() - t0
+    log = logger.warning if took_s > 2.0 else logger.info
+    log(f"tool {server}.{action}: {took_s * 1000:.0f} ms")
+    return result
 
 
 def _framed(server: str, action: str, result: str) -> str:
@@ -682,9 +778,11 @@ class ServerGateway:
 #
 #   GUARDS    run in order before anything executes — the first denial
 #             wins and is spoken unframed. Cheap rejections come first;
-#             the confirm gate runs LAST so the user is only ever asked to
-#             approve a call that is allowed, well-formed, not struck out
-#             and not already known to fail.
+#             the confirm gate and the per-turn cap run LAST so the user
+#             is only ever asked to approve a call that is allowed,
+#             well-formed, not struck out and not already known to fail —
+#             and even an approved call cannot loop past its per-turn
+#             budget.
 #
 # Adding a rule = adding one function + one entry here.
 
@@ -694,6 +792,7 @@ GUARDS = (
     _circuit_breaker,
     _validate_args,
     _confirm_gate,
+    _per_turn_cap,
 )
 
 

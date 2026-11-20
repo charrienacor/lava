@@ -14,6 +14,11 @@ tray renders from, and the /ws voice websocket the page speaks:
     browser → REST     POST /api/greet?cid=…  mic is live — fire the instant
                                              greeting from the warm cache
 
+A spectator socket (/ws/view, the page opened as /?view=1) receives every
+live session's JSON events and reply audio — the orb UI runs on a laptop
+while a Pi's own mic owns the conversation (ui/pi_client.py speaks /ws from
+the Pi's hardware). Viewers own nothing and can say nothing.
+
 Startup is the slow part, by design: _warm_up (lifespan) connects the MCP
 servers once — including the asr/tts subprocesses, where Piper's voice model
 loads at import — and pre-synthesizes the greeting. The "ready" link is logged
@@ -29,9 +34,13 @@ the page's events — pipecat's websocket output transport only serializes
 audio, so reply text and turn events would never reach the wire without
 them. One pipeline session runs per browser tab, keyed by the ?cid= the
 page sends: a second tab with the same id is told "busy" instead of
-double-talking the same conversation.
+double-talking the same conversation. A tab also sends ?dn=0 — it denoises
+in the browser, so that session skips the server-side RNNoise (raw-mic
+clients keep it; see the /ws handler).
 
 Run:  .venv/bin/python ui/server.py [--port 8000]
+      .venv/bin/python ui/pi_client.py            # the Pi's mic/speaker as the voice
+      browser:  http://<host>:8000/?view=1        # the UI on another device
 """
 
 import asyncio
@@ -64,6 +73,7 @@ from llm import fallback_model, on_fallback_model  # noqa: E402  (LLM resilience
 from llm import on_rate_limit  # noqa: E402  (Groq 429 visibility)
 from text_clean import plain_speech  # noqa: E402  (markdown -> plain sentences)
 from asr import UtteranceDroppedFrame, VoiceNotRecognizedFrame  # noqa: E402
+from turn_clock import TurnClock  # noqa: E402  (TTFA milestones)
 from mcp_client import (  # noqa: E402
     HEALTH as MCP_HEALTH,
     build_mcp_clients,
@@ -235,18 +245,19 @@ class Session:
         self.upstream_tap = LavaTap(self, "user")
         self.downstream_tap = LavaTap(self, "bot")
         self._tasks: list[asyncio.Task] = []
-        # Per-turn latency budget (see turn_first_audio): the taps stamp
-        # milestones as frames flow through, and the first reply audio
-        # publishes the turn's TTFA with its stage split.
-        self._turn_t0: float | None = None        # first turn signal (VAD stop or transcript)
-        self._turn_asr_ms: float | None = None    # transcript in hand since then
+        # Per-turn latency budget: the taps stamp milestones on this clock
+        # as frames flow through, and the first reply audio publishes the
+        # turn's TTFA with its stage split (turn_clock.py — re-armed at
+        # every VAD stop so a stray noise stop cannot anchor the wait).
+        self._clock = TurnClock()
 
     async def send(self, payload: dict) -> None:
-        """Best-effort JSON event; a closing page has nothing left to hear."""
-        try:
-            await self.ws.send_json(payload)
-        except Exception:
-            pass
+        """Best-effort JSON event to the page; live spectators mirror it.
+
+        The fan-out is spawned before the owner's send so a slow viewer can
+        never sit on the turn's path (each viewer is its own task)."""
+        _fan_out_json(payload)
+        await _send_json(self.ws, payload)
 
     def start(self, worker, llm_context) -> None:
         """Pipeline is live: launch the greeting gate and the ask pump."""
@@ -282,11 +293,13 @@ class Session:
 
     async def _send_greeting(self) -> None:
         pcm, rate = GREETING_AUDIO
+        wire = struct.pack("<H", rate) + pcm
         try:
             # Text first (bubble fills), then audio (orb flips to speaking),
             # then done — the same order the pipeline emits for a turn.
             await self.send({"type": "text", "t": GREETING_TEXT})
-            await self.ws.send_bytes(struct.pack("<H", rate) + pcm)
+            _fan_out_bytes(wire)  # spectators hear the greeting too
+            await self.ws.send_bytes(wire)
             await self.send({"type": "done", "reply": GREETING_TEXT})
         except Exception:
             pass  # the page left before the greeting could land
@@ -295,41 +308,43 @@ class Session:
     # The article pattern: TTFA — user stops speaking → first reply audio —
     # is the number the user experiences, and it must be split per stage to
     # know where the time hides. The taps stamp the milestones; the turn
-    # ends at the first reply audio with an INFO line.
+    # ends at the first reply audio with an INFO line. The clock semantics
+    # live in turn_clock.py; these are thin delegates.
 
     def turn_vad_stop(self) -> None:
-        """User's speech just ended (VAD): the TTFA clock starts now.
+        """User's speech just ended (VAD): (re)arm the TTFA clock.
 
-        The transcript frame occasionally races in FIRST (ASR runs on a
-        background task), so the earlier of the two signals anchors the
-        clock and the existing asr split is kept, not cleared.
+        EVERY stop re-arms: the old clock armed once and a stray
+        noise-triggered stop anchored the whole measurement while the
+        user went on talking — the huge "endpointing+ASR" lines in the
+        logs were that artifact, not a real wait. When SmartTurn says
+        INCOMPLETE the user continues, and each later stop moves the
+        anchor to the segment that actually commits the turn.
         """
-        if self._turn_t0 is None:
-            self._turn_t0 = time.monotonic()
+        self._clock.vad_stop()
 
     def turn_transcript(self) -> None:
         """Final transcript in hand: how long endpointing + ASR took."""
-        if self._turn_t0 is None:
-            self._turn_t0 = time.monotonic()
-        self._turn_asr_ms = (time.monotonic() - self._turn_t0) * 1000
+        self._clock.transcript()
+
+    def turn_typed(self) -> None:
+        """A tray chip became the user turn: anchor at the typed request."""
+        self._clock.typed()
 
     def turn_discard(self) -> None:
         """Turn ended without a reply (noise/drop/error): rewind the clock."""
-        self._turn_t0 = None
-        self._turn_asr_ms = None
+        self._clock.discard()
 
     def turn_first_audio(self) -> None:
         """First reply audio is out: publish this turn's TTFA budget."""
-        if self._turn_t0 is None:
+        split = self._clock.first_audio()
+        if split is None:
             return  # no pending user turn (greeting, barge spill, ...)
-        ttfa_ms = (time.monotonic() - self._turn_t0) * 1000
-        asr_ms = self._turn_asr_ms
-        self.turn_discard()
+        ttfa_ms, asr_ms, llm_ms = split
         if asr_ms is not None:
-            rest_ms = ttfa_ms - asr_ms
             logger.info(
                 f"TTFA {ttfa_ms:.0f} ms — endpointing+ASR {asr_ms:.0f} ms, "
-                f"LLM+TTS {rest_ms:.0f} ms"
+                f"LLM+TTS {llm_ms:.0f} ms"
             )
         else:
             logger.info(f"TTFA {ttfa_ms:.0f} ms — (no transcript this turn)")
@@ -350,6 +365,7 @@ class Session:
         while True:
             try:
                 text = await self.asks.get()
+                self.turn_typed()  # anchor TTFA at the typed request
                 llm_context.add_message({"role": "user", "content": text})
                 await worker.queue_frames([LLMRunFrame()])
             except asyncio.CancelledError:
@@ -388,6 +404,41 @@ def _spawn(coro) -> None:
     task.add_done_callback(_BACKGROUND.discard)
 
 
+# ---- spectators (?view=1) ---------------------------------------------------
+# A viewer socket receives every live session's events and reply audio but
+# owns no pipeline and can say nothing: the orb UI on a laptop watching the
+# conversation a Pi's own mic owns (ui/pi_client.py). Mirroring is
+# fire-and-forget per viewer — a stuck spectator can never delay the owner.
+VIEWERS: set[WebSocket] = set()
+
+
+async def _send_json(ws: WebSocket, payload: dict) -> None:
+    """Best-effort JSON to one socket (a closing client has nothing left to hear)."""
+    try:
+        await ws.send_json(payload)
+    except Exception:
+        pass
+
+
+async def _send_bytes(ws: WebSocket, data: bytes) -> None:
+    try:
+        await ws.send_bytes(data)
+    except Exception:
+        pass
+
+
+def _fan_out_json(payload: dict) -> None:
+    """Mirror a JSON event to every viewer, one task each."""
+    for viewer in list(VIEWERS):
+        _spawn(_send_json(viewer, payload))
+
+
+def _fan_out_bytes(data: bytes) -> None:
+    """Mirror a binary frame (reply audio) to every viewer."""
+    for viewer in list(VIEWERS):
+        _spawn(_send_bytes(viewer, data))
+
+
 def broadcast_toast(key: str, title: str, sub: str, cat: str = "system") -> None:
     """Send a toast to every connected session, throttled per key."""
     now = time.monotonic()
@@ -396,7 +447,8 @@ def broadcast_toast(key: str, title: str, sub: str, cat: str = "system") -> None
     _last_toast_at[key] = now
     payload = {"type": "toast", "key": key, "cat": cat, "title": title, "sub": sub}
     for session in list(SESSIONS.values()):
-        _spawn(session.send(payload))
+        _spawn(_send_json(session.ws, payload))  # owners directly (send would double-mirror)
+    _fan_out_json(payload)  # spectators once
 
 
 def _on_groq_rate_limit():
@@ -618,7 +670,9 @@ class LavaSerializer(FrameSerializer):
         if isinstance(frame, OutputAudioRawFrame):
             # [uint16 LE sample rate][16-bit LE mono PCM] — the page reads
             # the rate per chunk, so the pipeline's 24 kHz output just works.
-            return struct.pack("<H", frame.sample_rate) + frame.audio
+            data = struct.pack("<H", frame.sample_rate) + frame.audio
+            _fan_out_bytes(data)  # spectators hear her too (their orb animates)
+            return data
         return None
 
 
@@ -770,6 +824,14 @@ async def voice(websocket: WebSocket):
         # edits arrive via watch.
         await session.send({"type": "mcp", "servers": _tray_snapshot()["servers"]})
 
+        # Denoise is per client now: a browser page asks for WebRTC noise
+        # suppression in getUserMedia (app.js), so a tab that declares
+        # itself with ?dn=0 skips the server-side RNNoise — duplicate
+        # denoising on the Pi's four cores, for every frame, for nothing.
+        # Raw-mic clients (ui/pi_client.py, the dev runner) send no dn and
+        # keep the full front end. RNNOISE=0 in .env stays the global kill
+        # switch (pipeline.input_filter).
+        browser_denoised = websocket.query_params.get("dn") == "0"
         transport = FastAPIWebsocketTransport(
             websocket,
             params=FastAPIWebsocketParams(
@@ -777,9 +839,9 @@ async def voice(websocket: WebSocket):
                 audio_out_enabled=True,
                 add_wav_header=False,
                 # Acoustic front-end: music/TV/room noise is suppressed
-                # before the VAD and ASR ever see it (RNNOISE=0 skips it —
-                # the browser already denoises; see pipeline.input_filter).
-                audio_in_filter=pipeline.input_filter(),
+                # before the VAD and ASR ever see it (see the dn note and
+                # pipeline.input_filter).
+                audio_in_filter=None if browser_denoised else pipeline.input_filter(),
                 serializer=LavaSerializer(session),
                 session_timeout=SESSION_TIMEOUT_SECS,
             ),
@@ -802,6 +864,29 @@ async def voice(websocket: WebSocket):
         await session.stop()
         SESSIONS.pop(cid, None)
         logger.info(f"Session {cid} disconnected")
+
+
+@app.websocket("/ws/view")
+async def view(websocket: WebSocket):
+    """Spectator: every live session's events and reply audio, nothing owned.
+
+    Mirroring happens at the sources (Session.send, LavaSerializer,
+    broadcast_toast) — this endpoint only registers the socket, pushes the
+    tray snapshot so the page renders complete, and waits for the disconnect.
+    Nothing a viewer sends is read; the receive loop exists to notice leaving.
+    """
+    await websocket.accept()
+    VIEWERS.add(websocket)
+    logger.info(f"Viewer connected ({len(VIEWERS)} watching)")
+    try:
+        await websocket.send_json({"type": "mcp", "servers": _tray_snapshot()["servers"]})
+        while True:
+            await websocket.receive_text()
+    except Exception:
+        pass
+    finally:
+        VIEWERS.discard(websocket)
+        logger.info(f"Viewer disconnected ({len(VIEWERS)} watching)")
 
 
 def _port() -> int:

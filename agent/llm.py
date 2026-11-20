@@ -1,6 +1,8 @@
-"""LLM service — Groq GPT-OSS-120B (streaming) with a GPT-OSS-20B fallback.
+"""LLM service — Groq streaming LLM with a fallback model for rate-limit
+bursts. Both models live in .env (GROQ_LLM_MODEL, LLM_FALLBACK_MODEL) —
+no code defaults; a missing var fails at startup with a clear error.
 
-The free tier's 8k TPM makes the 120b saturate in bursts: the OpenAI SDK
+The free tier's 8k TPM makes the primary saturate in bursts: the OpenAI SDK
 retries 429s silently with backoff and the user hears a long mute. Two layers
 handle that:
 
@@ -8,9 +10,9 @@ handle that:
   toast), and a fallback switch fires on_fallback_model listeners;
 - resilience: when the primary model fails after the SDK's own retries
   (429 / 5xx / transport), requests switch to the small model for a cooldown
-  window — the 20b has far higher limits, so the conversation keeps flowing.
-  The window is sticky (subsequent requests go straight to the fallback) and
-  the primary is probed again when it lapses.
+  window — the fallback has far higher limits, so the conversation keeps
+  flowing. The window is sticky (subsequent requests go straight to the
+  fallback) and the primary is probed again when it lapses.
 """
 
 import asyncio
@@ -22,13 +24,8 @@ import openai
 from loguru import logger
 from pipecat.services.groq.llm import GroqLLMService
 
-DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
-DEFAULT_FALLBACK_MODEL = "openai/gpt-oss-20b"
 FALLBACK_COOLDOWN_SECS = 60.0
 
-# Errors a different model can plausibly survive. Deliberately excluded:
-# auth errors (a key problem affects both models) and CancelledError
-# (barge-in — must propagate untouched).
 _FALLBACK_ERRORS = (
     openai.RateLimitError,       # 429, after the SDK's own retries
     openai.InternalServerError,  # 5xx
@@ -37,11 +34,7 @@ _FALLBACK_ERRORS = (
     asyncio.TimeoutError,        # pipecat-level timeout, if enabled
 )
 
-# Rate-limit visibility: the OpenAI SDK retries 429s silently with backoff
-# (honoring Retry-After) — the user just experiences a long mute. Listeners
-# registered here fire the moment a 429 hits the wire, so the UI can say
-# "rate limited" while the retry is still running. Registry is plain and
-# host-agnostic: ui/server.py subscribes a broadcast to its sessions.
+
 RateLimitListener = Callable[[], Awaitable[None] | None]
 _RATE_LIMIT_LISTENERS: list[RateLimitListener] = []
 
@@ -89,32 +82,21 @@ def groq_api_key() -> str:
 
 
 def groq_model() -> str:
-    return os.environ.get("GROQ_LLM_MODEL", DEFAULT_LLM_MODEL)
+    model = os.environ.get("GROQ_LLM_MODEL")
+    if not model:
+        raise RuntimeError("GROQ_LLM_MODEL is not set (add it to .env)")
+    return model
 
 
 def fallback_model() -> str:
     """The small model that takes over when the primary is unavailable."""
-    return os.environ.get("LLM_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
+    model = os.environ.get("LLM_FALLBACK_MODEL")
+    if not model:
+        raise RuntimeError("LLM_FALLBACK_MODEL is not set (add it to .env)")
+    return model
 
 
 def create_llm(system_instruction: str | None = None) -> GroqLLMService:
-    # max_retries rides through to the OpenAI-compatible client: the SDK
-    # retries 429/5xx with backoff honoring Retry-After. Two is the right
-    # budget for a voice agent — quick retries soak the transient blips, and
-    # a sustained 429 surfaces to the model-fallback wrapper early instead of
-    # stretching into a long mute (4 retries on the 8k-TPM free tier bought
-    # ~11 s of silence before the first token).
-    #
-    # reasoning_effort="low": GPT-OSS is a reasoning model, and its thinking
-    # ran 0.2–5.1 s before the first speakable token in real turns — TTFA
-    # pays all of it. A voice agent needs tool sense, not essays; "low" keeps
-    # tool planning while cutting most of the think time (override with
-    # LLM_REASONING_EFFORT if a task ever needs deeper reasoning).
-    #
-    # system_instruction: the persona lives here, on the service — pipecat
-    # 1.9 deprecated a "system" message in LLMContext (removed in 2.0), and
-    # the service-level instruction is where the framework composes its own
-    # guidance around it.
     llm = GroqLLMService(
         api_key=groq_api_key(),
         settings=GroqLLMService.Settings(

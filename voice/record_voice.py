@@ -4,8 +4,8 @@ Saves 16 kHz mono WAV clips (the same format the ASR pipeline sends) with a
 live input-level meter so you can see the mic is picking you up. Then feed
 the clips to the enrollment script:
 
-    .venv/bin/python agent/record_voice.py --samples 3
-    .venv/bin/python agent/enroll_voice.py data/recordings/voice_*.wav
+    .venv/bin/python voice/record_voice.py --samples 3
+    .venv/bin/python voice/enroll_voice.py data/recordings/voice_*.wav
 
 Mic access: on macOS, allow your terminal microphone access when prompted
 (System Settings → Privacy & Security → Microphone). On the RPi, install
@@ -122,7 +122,7 @@ def main() -> None:
             paths.append(str(p.relative_to(ROOT)))
         except ValueError:  # clip saved outside the project — show the full path
             paths.append(str(p))
-    print("  .venv/bin/python agent/enroll_voice.py " + " ".join(paths))
+    print("  .venv/bin/python voice/enroll_voice.py " + " ".join(paths))
 
 
 if __name__ == "__main__":

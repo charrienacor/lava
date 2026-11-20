@@ -7,17 +7,17 @@ dependency) and the preprocessing is pure numpy. The RPi install therefore
 needs no torch, librosa, or scipy — the ~600 MB that broke `pip install`
 on a weak connection.
 
-Artifacts, built once on the dev machine by tools/export_voice_encoder.py:
+Artifacts, built once on the dev machine by voice/export_voice_encoder.py:
 
-    models/voice_encoder.onnx   the LSTM encoder, ~6 MB
-    models/mel_basis.npy        the 40 x 201 Slaney mel filterbank, 32 KB
+    voice/models/voice_encoder.onnx   the LSTM encoder, ~6 MB
+    voice/models/mel_basis.npy        the 40 x 201 Slaney mel filterbank, 32 KB
 
 Everything below is a faithful port of resemblyzer 0.1.4 (hparams.py,
 audio.py, voice_encoder.py): volume normalization to -30 dBFS, webrtcvad
 silence trimming, a 25 ms/10 ms 40-band mel spectrogram, 1.6 s partial
 utterances at 1.3/s (0.75 min coverage), the mean of partial embeddings,
 and L2 normalization. Embeddings match resemblyzer's to ~1e-6 cosine
-(checked by tools/export_voice_encoder.py --verify), so a voiceprint
+(checked by voice/export_voice_encoder.py --verify), so a voiceprint
 enrolled under resemblyzer stays valid as-is.
 """
 
@@ -41,9 +41,9 @@ N_FFT = int(SAMPLING_RATE * MEL_WINDOW_LENGTH / 1000)     # 400
 HOP_LENGTH = int(SAMPLING_RATE * MEL_WINDOW_STEP / 1000)  # 160
 INT16_MAX = (2**15) - 1
 
-_ROOT = Path(__file__).resolve().parents[1]
-_MODEL_PATH = _ROOT / "models" / "voice_encoder.onnx"
-_MEL_BASIS_PATH = _ROOT / "models" / "mel_basis.npy"
+_HERE = Path(__file__).resolve().parent          # voice/
+_MODEL_PATH = _HERE / "models" / "voice_encoder.onnx"
+_MEL_BASIS_PATH = _HERE / "models" / "mel_basis.npy"
 
 try:
     import webrtcvad
@@ -192,7 +192,7 @@ def load_mel_basis(path: Path | None = None) -> None:
     path = Path(path) if path else _MEL_BASIS_PATH
     if not path.exists():
         raise FileNotFoundError(
-            f"mel filterbank missing: {path} — run tools/export_voice_encoder.py "
+            f"mel filterbank missing: {path} — run voice/export_voice_encoder.py "
             "on the dev machine and copy the models/ folder over"
         )
     _MEL_BASIS = np.load(path)
@@ -239,7 +239,7 @@ class OnnxVoiceEncoder:
     """The resemblyzer voice encoder as an ONNX runtime session (CPU).
 
     Same weights as resemblyzer's pretrained.pt — the ONNX graph is exported
-    from them (tools/export_voice_encoder.py) — so embeddings are the same
+    from them (voice/export_voice_encoder.py) — so embeddings are the same
     up to float noise.
     """
 
@@ -250,7 +250,7 @@ class OnnxVoiceEncoder:
         if not model_path.exists():
             raise FileNotFoundError(
                 f"voice encoder model missing: {model_path} — export it on the "
-                "dev machine (tools/export_voice_encoder.py) and copy models/"
+                "dev machine (voice/export_voice_encoder.py) and copy models/"
             )
         load_mel_basis(mel_basis_path)
         self._session = ort.InferenceSession(

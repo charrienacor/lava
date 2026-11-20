@@ -16,14 +16,15 @@ voice in → RNNoise → Silero VAD → ASR (MCP: Groq Whisper large-v3-turbo, s
 |---|---|---|
 | Orchestrator | `agent/pipeline.py` | entry point, transports, `.env` load (single source), audio rates |
 | MCP layer | `agent/mcp_client.py` | one client per server (`mcp/mcp_servers.json`), allowlists, tool-call audit |
-| Tool policy | `agent/tools/*.toml` | `enabled` per tool + `confirm = true` for protected actions — the single source of truth |
+| Tool policy | `agent/tools/*.toml` | `enabled` per tool, `confirm = true` for protected actions, `identity = [...]` binding each spoken approval to its target — the single source of truth |
 | Tool gateways | `agent/tool_gateway.py` | progressive disclosure (1 generic tool per heavy server, TOML-generated index) + enforced confirm gate + result framing |
 | Voice bridges | `agent/asr.py`, `agent/tts.py` | drive the asr/tts MCP servers directly (excluded from the LLM schema) |
 | Acoustics | `agent/vad.py` + RNNoise filter | 16 kHz in, RNNoise denoise, tuned Silero VAD + **SmartTurn v3.2 semantic end-of-turn** (bundled 8.7 MB ONNX, ~40 ms/verdict) — a mid-thought pause no longer commits a turn; `SMART_TURN=0` falls back to VAD timers only |
 | Context | `agent/context.py`, `agent/prompt.py` | system prompt personalized from `data/profile.yaml`; auto context summarization — no memory/RAG: one conversation at a time, history summarized when it grows |
-| Identity | `mcp/asr_server.py`, `agent/enroll_voice.py`, `agent/record_voice.py` | voiceprint at `data/voiceprint.json` (0600); gate fails open until enrolled; speaker encoder is a 6 MB ONNX LSTM (`models/`, no torch) |
+| Identity | `mcp/asr_server.py`, `voice/enroll_voice.py`, `voice/record_voice.py` | voiceprint at `data/voiceprint.json` (0600); gate fails open until enrolled; speaker encoder is a 6 MB ONNX LSTM (`voice/models/`, no torch) |
 | Web UI | `ui/server.py`, `ui/static/` | voice UI + one pipeline per browser tab on one origin; warm MCP clients and a pre-synthesized greeting shared by every session |
-| Launcher | `run.sh` | creates `.venv` on first run, checks `.env`, starts `ui/server.py` |
+| Latency meter | `agent/turn_clock.py` | honest per-turn TTFA milestones: the clock re-arms at every VAD stop, so the `TTFA …` log split measures the real wait |
+| Launcher | `run.sh` / `pi_run.sh` | laptop flow: `run.sh` creates `.venv` on first run, checks `.env`, starts `ui/server.py`; Pi flow: `pi_run.sh` preflights keys + imports, starts the server in the background and runs `ui/pi_client.py` on the Pi's own mic |
 
 ## Our MCP servers (ASR + TTS)
 
@@ -32,7 +33,7 @@ by the agent from `mcp/mcp_servers.json`:
 
 | Server | Tools | Model |
 |---|---|---|
-| `mcp/asr_server.py` | `transcribe(audio_b64, fmt)`, `enroll(audio_b64, fmt)` | Groq Whisper large-v3-turbo, gated by an on-device speaker encoder (`mcp/voice_encoder.py`) |
+| `mcp/asr_server.py` | `transcribe(audio_b64, fmt)`, `enroll(audio_b64, fmt)` | Groq Whisper large-v3-turbo, gated by an on-device speaker encoder (`voice/voice_encoder.py`) |
 | `mcp/tts_server.py` | `speak(text)` → Base64 WAV | Piper `en_US-hfc_female-medium` (ONNX, on-device), warmed at load |
 
 A tool that fails server-side comes back as an MCP `is_error` result; the
@@ -42,10 +43,43 @@ are never exposed to the LLM.
 
 ## Token economy (Groq free tier: 8,000 tokens/minute)
 
-Full tool schemas cost ~8,500 tokens per request — over the whole budget.
-Every capability server therefore hides behind **one** gateway tool whose
-definition is a compact TOML-generated index: **~1,216 tokens total**
-(github 504, spotify 367, tavily 174, time 171). The model calls
+Every LLM request re-sends its fixed overhead, so size is both latency and
+quota. Each capability server therefore hides behind **one** gateway tool
+whose definition is a compact TOML-generated index instead of its full
+schemas:
+
+| Server | Full schemas (never sent) | Gateway index (sent) | Saved |
+|---|---|---|---|
+| github — 10 actions | ~2,540 | ~800 | ~1,740 |
+| spotify — 10 actions | ~1,100 | ~530 | ~570 |
+| tavily — 2 actions | ~1,610 | ~370 | ~1,240 |
+| time — 2 actions | ~290 | ~310 | −20 \* |
+| **Total** | **~5,540** | **~2,020** | **~3,520** |
+
+\* the one server whose index is bigger than its raw schemas — they are
+tiny already; it stays behind the gateway for the uniform call shape, not
+the size.
+
+The rest of each request:
+
+| Piece | Tokens |
+|---|---|
+| System prompt (identity, date, profile, style) | ~380 |
+| Conversation context (auto-summarized past 4,000 tokens / 12 messages) | ≤ ~4,000 |
+| **Fixed overhead per request** | **~2,400** |
+
+At full-schema size, one tool-call turn (two requests) would spend
+~11,000 tokens — over a whole minute's budget before a single word of
+context. At the index's ~2,400 the same turn leaves most of the 8k for
+the conversation.
+
+Per action the index carries a one-line operating summary — the TOML
+description's first sentence, ≤170 chars — plus the exact argument names
+captured live from the server, and the **values** of enum-valued params
+(`time_range(day|week|month|year)`): with names only, the model invents
+values and burns a turn on the rejection. `include_*` display toggles are
+deliberately left off the wire — naming `include_raw_content` would
+invite multi-k raw dumps into an 8k-TPM context. The model calls
 `github(action="merge_pull_request", arguments={...})`; the gateway validates
 the action against the TOML and forwards over the real MCP session. The OpenAI
 client retries 429/5xx with backoff (`llm.py`), and long conversations
@@ -108,12 +142,23 @@ What the voice loop does to keep time-to-first-audio low:
 - **Short first sentence**: the prompt asks the model to lead with a short
   sentence, since speech starts only once it is complete.
 - **Fast end-of-turn**: SmartTurn lets the VAD stop window stay at 0.2 s.
+- **Honest TTFA logging**: the per-turn
+  `TTFA … — endpointing+ASR …, LLM+TTS …` line measures from the stop that
+  **committed** the turn (`agent/turn_clock.py` re-arms at every VAD stop;
+  typed tray chips anchor at the typed request). The old clock anchored at
+  the first stop of a session segment-chain, so one noise-triggered stop
+  produced fake 46–120 s "endpointing+ASR" splits — tune from the new line.
+- **One denoiser per client**: browser tabs ask for WebRTC noise
+  suppression in `getUserMedia` and connect with `?dn=0`, so those
+  sessions skip server-side RNNoise — duplicate denoising on the Pi's
+  four cores, frame after frame. Raw-mic clients (`ui/pi_client.py`) keep
+  the full front end.
 
 ### Knobs (`.env`)
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RNNOISE` | `1` | `0` skips server-side RNNoise — the browser already denoises; saves Pi CPU |
+| `RNNOISE` | `1` | server-side RNNoise for raw mics; browser tabs auto-skip it via `?dn=0` (they denoise in-page), `0` forces it off everywhere |
 | `SMART_TURN` | `1` | `0` = VAD timers only (no SmartTurn inference per pause) |
 | `LLM_REASONING_EFFORT` | `low` | GPT-OSS think time before the first token |
 | `LLM_KEEPALIVE_SECS` | `45` | keeps the Groq LLM connection open per session (`0` = warm once) |
@@ -131,46 +176,44 @@ The remote Spotify MCP server (`https://spotify-mcp.charrienacor.workers.dev/mcp
 in `mcp_servers.json`) is [spotify-mcp-cloudflare](https://github.com/charrienacor/spotify-mcp-cloudflare)
 — deployed from that repo to Cloudflare Workers.
 
-No OAuth helper: the bearer lives in `.env` as `SPOTIFY_ACCESS_TOKEN` and is
-sent verbatim (`mcp_servers.json` expands `${SPOTIFY_ACCESS_TOKEN}` into the
-Authorization header). Renew it yourself when it expires — e.g. with
-`npx @modelcontextprotocol/inspector` against the spotify server — then
-restart Lava: the bearer is frozen into the client at connect time. An
-expired token just makes the spotify tools fail with a 401; everything else
-keeps working.
+Machine auth by API key: `.env` holds `SPOTIFY_API_KEY`, sent verbatim
+(`mcp_servers.json` expands it into the Authorization header). The worker
+accepts this key from the owner's agent before its OAuth layer — no browser,
+no token expiry, no Inspector dance. Rotate it with
+`npx wrangler secret put SPOTIFY_API_KEY` in `spotify-mcp-cloudflare/spotify-mcp`
+and update `.env` to match. Browser clients (Claude, Cursor, the Inspector)
+are unaffected — they still use the worker's OAuth sign-in flow.
 
 ## Raspberry Pi deploy
 
-```bash
-sudo apt install -y libportaudio2 build-essential
-./run.sh                          # first run builds .venv, then serves :8000
-```
-
-To keep it running, a systemd unit (adjust `User` and paths), saved as
-`/etc/systemd/system/lava.service`:
-
-```ini
-[Unit]
-Description=Lava voice agent
-After=network-online.target sound.target
-Wants=network-online.target
-
-[Service]
-User=pi
-WorkingDirectory=/home/pi/lava
-ExecStart=/home/pi/lava/.venv/bin/python ui/server.py
-Restart=always
-RestartSec=5
-Nice=-10
-
-[Install]
-WantedBy=multi-user.target
-```
+One command — the Pi's own mic and speaker, everything else follows:
 
 ```bash
-sudo systemctl enable --now lava
-journalctl -u lava -f             # operational log
+sudo apt install -y libportaudio2 build-essential   # once (portaudio)
+bash pi_run.sh                                      # server + the Pi's voice
 ```
+
+First run builds the `.venv` (uv if available, else pip) and installs
+`websockets`; every run then preflights before starting anything:
+
+- **Boot-critical keys** (`GROQ_API_KEY`, `GROQ_LLM_MODEL`, `LLM_FALLBACK_MODEL`,
+  `ASR_MODEL`) fail fast **by name** if missing from `.env`; optional ones
+  (`GITHUB_PAT`, `TAVILY_API_KEY`, `SPOTIFY_API_KEY`) warn and that server
+  is skipped.
+- **Import smoke test** — a partial rsync (a missing agent module) fails in
+  seconds instead of surfacing as a server death after the warm-up.
+- **Warm wait** — up to ~3 min (MCP connect + Piper voice load), then it
+  prints the viewer URL. A partial warmup doesn't kill the run: it says
+  which didn't connect and the UI connects per tap (slower, still works).
+
+```bash
+bash pi_run.sh stop     # kill a running setup (Ctrl+C stops both too)
+```
+
+The laptop or phone just opens the viewer — `http://<pi-ip>:8000/?view=1` —
+and mirrors the Pi's conversation; viewers own no mic. Console log:
+`logs/pi_server.log` (truncated each run so the warm check stays honest);
+the operational log is `logs/web.log`.
 
 ### Pi 4 performance tuning
 
@@ -192,7 +235,8 @@ journalctl -u lava -f             # operational log
   jitter is latency. On Wi-Fi: `sudo iw wlan0 set power_save off`.
 - **Storage**: boot from a USB 3 SSD instead of the SD card; use zram swap.
 - **Browser off the Pi**: Chromium competes with Silero, SmartTurn and Piper
-  for four cores. Open the UI from a phone or laptop and set `RNNOISE=0`.
+  for four cores. Open the UI from a phone or laptop — browser tabs skip the
+  server-side RNNoise on their own (`?dn=0`), so nothing else needs flipping.
 - **Read the TTFA log**: high `endpointing+ASR` → try `SMART_TURN=0`; Piper's
   real-time factor above ~0.5 → a lighter voice; slowest first token → try
   `GROQ_LLM_MODEL=openai/gpt-oss-20b` (some loss in quality).
@@ -215,7 +259,7 @@ pactl set-default-sink lava_aec_sink
 ## Enroll the owner's voice
 
 ```bash
-.venv/bin/python agent/record_voice.py --samples 3   # follow the printed command
+.venv/bin/python voice/record_voice.py --samples 3   # follow the printed command
 ```
 
 Deleting `data/voiceprint.json` returns the gate to fail-open.

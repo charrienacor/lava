@@ -1,6 +1,8 @@
 # Tools exposed by the 'github' MCP server (113 found).
 # Flip `enabled` to choose what the LLM sees; `confirm = true` requires spoken
-# user approval before the gateway runs the tool (see tool_gateway.py).
+# user approval before the gateway runs the tool; `identity = [...]` names the
+# arguments that approval binds to — every other argument is payload and rides
+# along after a "yes" (see tool_gateway.py).
 # Read directly at startup.
 
 [server]
@@ -21,6 +23,7 @@ name = "create_or_update_file"
 description = "Create or update a single file; content = RAW text committed exactly as sent (never base64-encode it). Updating an existing file needs its current sha (from get_file_contents)."
 enabled = true
 confirm = true
+identity = ["owner", "repo", "branch", "path"]
 
 [[tool]]
 name = "create_pull_request"
@@ -29,13 +32,14 @@ enabled = true
 
 [[tool]]
 name = "create_repository"
-description = "Create a new GitHub repository."
+description = "Create a repo (autoInit=true if push_files follows); a public repo named <login>.github.io auto-publishes via GitHub Pages at https://<login>.github.io."
 enabled = true
 confirm = true
+identity = ["name", "org"]
 
 [[tool]]
 name = "get_file_contents"
-description = "Get the contents of a file or directory from a GitHub repository"
+description = "Read a file or directory from a repo; on a site repo, review current files or get the blob sha before updating one with create_or_update_file."
 enabled = true
 
 [[tool]]
@@ -68,12 +72,14 @@ name = "merge_pull_request"
 description = "Merge a pull request in a GitHub repository."
 enabled = true
 confirm = true
+identity = ["owner", "repo", "pullNumber"]
 
 [[tool]]
 name = "push_files"
-description = "Push multiple files to a GitHub repository in a single commit; each file is {path, content} with content = RAW text (never base64-encode it)."
+description = "Push files in one commit (content is raw text, never base64); pushing index.html to the <login>.github.io repo publishes the site, live within a minute or two. Each file is {path, content}; updating an existing repo still needs owner, repo, branch and a commit message."
 enabled = true
 confirm = true
+identity = ["owner", "repo", "branch"]
 
 [[tool]]
 name = "search_issues"
@@ -82,7 +88,7 @@ enabled = false
 
 [[tool]]
 name = "search_repositories"
-description = "Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discovering projects, finding examples, or locating specific repositories across GitHub."
+description = "Find repos by name/description/readme/topics; 'user:<login>' lists the user's own projects — bio material when building their personal site. Perfect for discovering projects or locating specific repositories across GitHub."
 enabled = true
 
 [[tool]]
@@ -158,7 +164,9 @@ enabled = false
 [[tool]]
 name = "delete_file"
 description = "Delete a file from a GitHub repository"
-enabled = false
+enabled = true
+confirm = true
+identity = ["owner", "repo", "branch", "path"]
 
 [[tool]]
 name = "discussion_comment_write"
@@ -267,7 +275,7 @@ enabled = false
 
 [[tool]]
 name = "get_me"
-description = "Get details of the authenticated GitHub user. Use this FIRST when a request is about the user's own profile or when a website repo name or URL is needed (it returns the username)."
+description = "The signed-in user's GitHub identity (login, name, bio) — call FIRST for tasks about their own account or site; the <login>.github.io repo name comes from this login. Call it before any action that needs the user's username, and to source profile details for a personal website."
 enabled = true
 
 [[tool]]

@@ -13,10 +13,10 @@ logs/
 *.wav
 data/memory.db
 
-# piper voices are ~60 MB each; fetch with:
+# piper TTS model is ~60 MB; fetch with:
 #   python3 -m piper.download_voices en_US-hfc_female-medium
-voices/*.onnx
-voices/*.onnx.json
+#   (lands in mcp/tts_model/)
+mcp/tts_model/
 
 # personal — never publish
 data/

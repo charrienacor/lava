@@ -15,8 +15,8 @@ from piper import PiperVoice
 mcp = MCPServer("tts")
 
 VOICE = (
-    Path(__file__).resolve().parents[1]
-    / "voices"
+    Path(__file__).resolve().parent
+    / "tts_model"
     / "en_US-hfc_female-medium.onnx"
 )
 

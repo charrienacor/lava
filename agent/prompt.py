@@ -13,11 +13,6 @@ You are Lava, a voice agent that listens and speaks at the same time, running
 locally on a Raspberry Pi 4.
 """
 
-# Without an explicit date the model answers current-events questions from
-# its pre-2026 training memory ("the midterms haven't happened yet") and
-# never reaches for search — even when the user names the year. The date is
-# computed at prompt build time (see system_prompt()) and paired with a hard
-# search-first rule, since the tool description alone was not enough.
 _AWARENESS_TEMPLATE = """\
 Current date: {today}. Your training data predates that — search
 (tavily_search) before answering anything current. Never answer from memory

@@ -5,7 +5,7 @@ any recorder app), sends each to the `enroll` tool on the asr MCP server,
 and averages them into data/voiceprint.json. The owner's name comes from
 data/profile.yaml. Until enrolled, the ASR gate is fail-open.
 
-    .venv/bin/python agent/enroll_voice.py sample1.wav [sample2.wav ...]
+    .venv/bin/python voice/enroll_voice.py sample1.wav [sample2.wav ...]
 """
 
 import asyncio
@@ -14,6 +14,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# mcp_client.py lives in agent/ — this script's own folder (voice/) is what
+# Python puts on sys.path when run as a script, so agent/ is added beside it.
+sys.path.insert(0, str(ROOT / "agent"))
 
 from dotenv import load_dotenv  # noqa: E402  (.env must load before clients)
 
@@ -25,7 +29,7 @@ from mcp_client import build_mcp_clients  # noqa: E402
 async def main(wav_paths: list[Path]) -> None:
     if not wav_paths:
         sys.exit(
-            "usage: .venv/bin/python agent/enroll_voice.py sample1.wav [sample2.wav ...]"
+            "usage: .venv/bin/python voice/enroll_voice.py sample1.wav [sample2.wav ...]"
         )
     missing = [p for p in wav_paths if not p.exists()]
     if missing:

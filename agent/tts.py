@@ -9,7 +9,6 @@ from typing import AsyncGenerator
 
 from loguru import logger
 from pipecat.frames.frames import ErrorFrame, Frame
-from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 

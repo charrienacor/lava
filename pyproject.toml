@@ -14,11 +14,11 @@ dependencies = [
     # acoustic front-end: RNNoise noise/music suppression (agent/pipeline.py)
     "pyrnnoise",
     # speaker gate: owner-verified ASR (mcp/asr_server.py voiceprint enrollment)
-    # — the encoder is ONNX (models/voice_encoder.onnx): no torch on the RPi
+    # — the encoder is ONNX (voice/models/voice_encoder.onnx): no torch on the RPi
     "onnxruntime",           # the gate's embedding runtime (pipecat base-dep, kept explicit)
     "webrtcvad",             # silence trimming before embedding
     "setuptools<81",         # webrtcvad imports pkg_resources (removed in 81)
-    # mic recording for enrollment (agent/record_voice.py); RPi needs
+    # mic recording for enrollment (voice/record_voice.py); RPi needs
     # libportaudio2 (sudo apt install libportaudio2) before this wheel
     "sounddevice",
     # pipecat dev runner (voice web client transport) + env/config
@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest", "onnx"]  # onnx: tools/export_voice_encoder.py (dev machine only)
+dev = ["pytest", "onnx"]  # onnx: voice/export_voice_encoder.py (dev machine only)
 
 [tool.pytest.ini_options]
 testpaths = ["agent/tests"]
