@@ -17,7 +17,7 @@ voice in → RNNoise → Silero VAD → ASR (MCP: Groq Whisper large-v3-turbo, s
 | Orchestrator | `agent/pipeline.py` | entry point, transports, `.env` load (single source), audio rates |
 | MCP layer | `agent/mcp_client.py` | one client per server (`mcp/mcp_servers.json`), allowlists, tool-call audit |
 | Tool policy | `agent/tools/*.toml` | `enabled` per tool, `confirm = true` for protected actions, `identity = [...]` binding each spoken approval to its target — the single source of truth |
-| Tool gateways | `agent/tool_gateway.py` | progressive disclosure (1 generic tool per heavy server, TOML-generated index) + enforced confirm gate + result framing |
+| Tool gateways | `agent/tool_gateway.py` | progressive disclosure (1 generic tool per heavy server, TOML-generated index) + enforced confirm gate + live-enum hints + rejected-argument stripping (`PARAM_INCOMPATIBILITIES`) + per-turn call caps + result framing |
 | Voice bridges | `agent/asr.py`, `agent/tts.py` | drive the asr/tts MCP servers directly (excluded from the LLM schema) |
 | Acoustics | `agent/vad.py` + RNNoise filter | 16 kHz in, RNNoise denoise, tuned Silero VAD + **SmartTurn v3.2 semantic end-of-turn** (bundled 8.7 MB ONNX, ~40 ms/verdict) — a mid-thought pause no longer commits a turn; `SMART_TURN=0` falls back to VAD timers only |
 | Context | `agent/context.py`, `agent/prompt.py` | system prompt personalized from `data/profile.yaml`; auto context summarization — no memory/RAG: one conversation at a time, history summarized when it grows |
@@ -34,7 +34,7 @@ by the agent from `mcp/mcp_servers.json`:
 | Server | Tools | Model |
 |---|---|---|
 | `mcp/asr_server.py` | `transcribe(audio_b64, fmt)`, `enroll(audio_b64, fmt)` | Groq Whisper large-v3-turbo, gated by an on-device speaker encoder (`voice/voice_encoder.py`) |
-| `mcp/tts_server.py` | `speak(text)` → Base64 WAV | Piper `en_US-hfc_female-medium` (ONNX, on-device), warmed at load |
+| `mcp/tts_server.py` | `speak(text)` → Base64 WAV | Piper (ONNX, on-device), voice via `TTS_VOICE` — default `en_US-hfc_female-medium`; the Pi runs `en_US-amy-low` (~30% less compute: hfc_medium measured RTF 0.73–1.16 on a Pi 4, barely realtime), warmed at load |
 
 A tool that fails server-side comes back as an MCP `is_error` result; the
 client raises on it (`McpToolError`), so an error message can never become a
@@ -79,7 +79,13 @@ captured live from the server, and the **values** of enum-valued params
 (`time_range(day|week|month|year)`): with names only, the model invents
 values and burns a turn on the rejection. `include_*` display toggles are
 deliberately left off the wire — naming `include_raw_content` would
-invite multi-k raw dumps into an 8k-TPM context. The model calls
+invite multi-k raw dumps into an 8k-TPM context. Arguments the server
+rejects in practice are stripped before the wire and never advertised
+(`PARAM_INCOMPATIBILITIES` — tavily's `country` failed in two separate
+ways in one evening; each 400 cost a call plus an LLM round trip, and
+the model re-learned the lesson every session). Every gateway call
+logs its wall time (`tool tavily.tavily_search: 930 ms`) — the ground
+truth for "is it the tool or the LLM around it". The model calls
 `github(action="merge_pull_request", arguments={...})`; the gateway validates
 the action against the TOML and forwards over the real MCP session. The OpenAI
 client retries 429/5xx with backoff (`llm.py`), and long conversations
@@ -93,13 +99,16 @@ self-compress (context summarization at 4,000 tokens / 12 messages).
   → `CONFIRMATION_REQUIRED` (the model must ask out loud). The re-call needs
   `confirmed=true` *and* a real user turn in the context since the request —
   the model cannot confirm for the user. Approval binds to the action's
-  **target** (`_IDENTITY_KEYS`): a "yes, but title it X" rides along; a
-  different PR/file/playlist needs fresh approval.
+  **target** (the TOMLs' `identity = [...]` keys, per action): a "yes, but
+  title it X" rides along; a different PR/file/playlist needs fresh approval.
 - **Injection**: tool results are delimited `<tool_result>` and the system
   prompt declares them untrusted data.
 - **Speaker gate**: only the enrolled owner's speech becomes a turn
-  (voiceprint cosine ≥ `ASR_SPEAKER_MIN_SIM`, default **0.50** in code);
-  non-owner speech yields no transcript and a "Not your voice" toast. With
+  (voiceprint cosine ≥ `ASR_SPEAKER_MIN_SIM`, default **0.50** in code; the
+  Pi runs **0.65** — her own Piper voice measured 0.46–0.56 against the
+  print, and at the default threshold she transcribed her own echo and
+  answered herself); non-owner speech yields no transcript and a "Not your
+  voice" toast. With
   `ASR_SPECULATIVE=1` (default) the audio is uploaded to Groq while the gate
   runs and a rejected segment's transcript is discarded — set it to `0` if
   non-owner audio must never leave the device. Known limits: threshold
@@ -152,7 +161,12 @@ What the voice loop does to keep time-to-first-audio low:
   suppression in `getUserMedia` and connect with `?dn=0`, so those
   sessions skip server-side RNNoise — duplicate denoising on the Pi's
   four cores, frame after frame. Raw-mic clients (`ui/pi_client.py`) keep
-  the full front end.
+  the full front end; the Pi itself runs `RNNOISE=0` since its webrtc AEC
+  already suppresses noise at the source (that resampler was burning
+  ~70% of a core at idle — CPU Piper needed).
+- **No learning 400s**: arguments the server rejects are stripped before
+  the wire (measured: tavily's `country` cost two wasted calls plus two
+  extra LLM requests per searched question — 4–6 s — before the strip).
 
 ### Knobs (`.env`)
 
@@ -165,6 +179,12 @@ What the voice loop does to keep time-to-first-audio low:
 | `ASR_SPECULATIVE` | `1` | Whisper upload runs in parallel with the speaker gate; rejected voices still reach Groq (`0` = gate first) |
 | `ASR_KEEPALIVE_SECS` | `45` | keeps the ASR server's Groq connection open while in use (`0` = warm once) |
 | `ASR_MODEL` | `whisper-large-v3-turbo` | the ASR server's model (turbo is the fast one) |
+| `ASR_SPEAKER_MIN_SIM` | `0.50` | gate threshold; the Pi runs `0.65` — above her synthetic voice's 0.46–0.56 scores |
+| `TTS_VOICE` | `en_US-hfc_female-medium` | the tts server's Piper voice; the Pi runs `en_US-amy-low` (hfc_medium measured RTF 0.73–1.16 on a Pi 4 — barely realtime) |
+| `ECHO_SUPPRESS` | `1` | pi_client's echo hold with loud-voice break-in (`0` = off; see AEC) |
+| `ECHO_BREAKIN_LEVEL` | `0.08` | peak that opens the mic mid-reply (measured: her echo peaks 0.025 post-AEC, your speech 0.1–1.0) |
+| `ECHO_HOLD_SECS` | `2.0` | the rolling window one loud syllable opens — your utterance flows uninterrupted |
+| `ECHO_SUPPRESS_TAIL_SECS` | `0.8` | mic stays dark after her last chunk (Bluetooth air time) |
 
 `ASR_*` / `TTS_*` variables are forwarded to their stdio MCP servers
 automatically (`mcp_client.py`). Every turn logs its real
@@ -238,16 +258,39 @@ the operational log is `logs/web.log`.
   for four cores. Open the UI from a phone or laptop — browser tabs skip the
   server-side RNNoise on their own (`?dn=0`), so nothing else needs flipping.
 - **Read the TTFA log**: high `endpointing+ASR` → try `SMART_TURN=0`; Piper's
-  real-time factor above ~0.5 → a lighter voice; slowest first token → try
-  `GROQ_LLM_MODEL=openai/gpt-oss-20b` (some loss in quality).
+  real-time factor above ~0.5 → `TTS_VOICE=en_US-amy-low` (measured: hfc_medium
+  RTF 0.73–1.16 on a Pi 4, amy-low ~30% less compute) and pair it with
+  `RNNOISE=0` — the webrtc AEC already suppresses noise at the source, and
+  the 48 kHz resampler was burning ~70% of a core at idle; slowest first
+  token → try `GROQ_LLM_MODEL=openai/gpt-oss-20b` (some loss in quality).
 
 ### Hands-free duplex (AEC)
 
 With a speaker and a mic on the same box the bot hears its own voice and can
 interrupt itself — RNNoise is a denoiser, not an echo canceller. A browser
 client doesn't need anything (Chrome applies AEC itself), and headphones
-bypass the echo path entirely. For a raw local mic, load the audio stack's
-echo canceller as the default source (PipeWire-Pulse / PulseAudio):
+bypass the echo path entirely. `pi_run.sh` handles the raw-mic case for you:
+it loads the audio stack's echo canceller (`module-echo-cancel`, webrtc) as
+`lava_aec` and points the default source/sink at the cancelled twins —
+pi_client's raw streams then route through it.
+
+Two measured realities on top of that:
+
+- **Bluetooth defeats the canceller** — the reference signal leads the
+  sound by ~200 ms and BT clock drift keeps the echo path moving, so the
+  adaptive filter never converges (measured: 5 dB). Wired output (the Pi's
+  3.5 mm jack or HDMI) converges properly (expect 20+ dB).
+- So `pi_client.py` adds an energy-gated hold (`ECHO_SUPPRESS=1`, the
+  default, + `ECHO_SUPPRESS_TAIL_SECS` 0.8 after the last chunk): her echo
+  never reaches the VAD — and the path stays **full-duplex**, with the line
+  drawn from measurements rather than guesswork (her echo peaks ~0.025 at
+  the mic post-AEC, your speech 0.1–1.0): one loud syllable (peak ≥
+  `ECHO_BREAKIN_LEVEL`, default 0.08) opens the mic for a rolling
+  `ECHO_HOLD_SECS` window so the whole utterance flows continuously and
+  barge-in fires mid-reply. `ECHO_SUPPRESS=0` once her output is wired and
+  the AEC converges.
+
+The manual AEC equivalent, if you ever need it (PipeWire-Pulse / PulseAudio):
 
 ```bash
 pactl load-module module-echo-cancel aec_method=webrtc \
@@ -262,7 +305,13 @@ pactl set-default-sink lava_aec_sink
 .venv/bin/python voice/record_voice.py --samples 3   # follow the printed command
 ```
 
-Deleting `data/voiceprint.json` returns the gate to fail-open.
+Enroll through the mic chain you'll actually use — the print matches what
+the gate *hears*. Changing the front end invalidates it: a raw-mic
+enrollment sagged to ~0.5 similarity once the webrtc AEC entered the path,
+the same range her own synthetic voice scores, and the gate could no
+longer tell you apart. Re-enroll after any AEC/mic change (the clips are
+recorded through the current default source, so the flow above just
+works). Deleting `data/voiceprint.json` returns the gate to fail-open.
 
 ## Known limits
 

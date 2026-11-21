@@ -38,6 +38,9 @@ Loop prevention (what was measured and what fixes it):
     the user is never asked to approve a call that was going to fail
     (ask-confirm-fail-fix-ask-again).
   * A ``confirmed`` flag nested inside ``arguments`` is honored.
+  * Server-side argument incompatibilities (schema-valid individually,
+    rejected combined) are stripped at call time — see
+    PARAM_INCOMPATIBILITIES — so the model never pays a learning 400.
 
 Patience (mechanical, from conversation-design practice): Google's Dialogflow
 ends a dialog after 3 no-input/no-match attempts, and ServiceNow's guide caps
@@ -173,8 +176,18 @@ def _schema(server: str, catalogue: list[tuple[str, str, bool]]) -> FunctionSche
             continue
         required = set(info.get("required") or [])
         enums = info.get("enums") or {}
+        # Params the gateway strips unconditionally are never advertised:
+        # naming them only invites the model to pass what cannot run.
+        always_stripped = {
+            param for param, rule in (
+                PARAM_INCOMPATIBILITIES.get(server, {}).get(action) or {}
+            ).items()
+            if rule is None
+        }
 
         def _advertised(p):
+            if p in always_stripped:
+                return False  # the gateway strips it — advertising invites waste
             # include_* display toggles stay off the wire: the model never
             # needs them, and naming include_raw_content invites multi-k
             # raw dumps into an 8k-TPM context. Required/enum params are
@@ -377,6 +390,63 @@ def _identity(server: str, action: str, args: dict[str, Any]) -> str:
 def _call_key(action: str, call_args: dict[str, Any]) -> str:
     """Fingerprint of an exact call (circuit-breaker key)."""
     return action + ":" + json.dumps(call_args, sort_keys=True, default=str)
+
+
+# Server-side argument incompatibilities the model cannot know: both params
+# are individually valid (the schema advertises them, the enum hints list
+# them), but the server rejects the combination. Measured: three
+# fix-retry ladders in one evening — country + search_depth=fast cost two
+# wasted calls and two extra LLM requests per searched question before the
+# model learns what the schema never said. The gateway strips the pair
+# silently at call time; one log line per strip keeps it auditable.
+PARAM_INCOMPATIBILITIES = {
+    "tavily": {
+        "tavily_search": {
+            # Two measured failure classes in one evening: "Country parameter
+            # is not supported for fast or ultra-fast search_depth" AND
+            # "Invalid country. Must be a valid country name…" (the model
+            # sent 'US', then 'USA', then 'United States' — burning a
+            # round trip each time it guessed wrong). The query carries
+            # geography better than this argument ever has, so country
+            # goes unconditionally: stripped at call time (None = always)
+            # and hidden from the advertised argument hints.
+            "country": None,
+        },
+    },
+}
+
+
+def _strip_incompatible(
+    server: str, action: str, call_args: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop arguments the server rejects (see the table).
+
+    A rule value of None strips the parameter unconditionally; a dict
+    {trigger: (bad_values...)} strips it only in those combinations.
+    In place, returns the same dict; one INFO line per strip so the
+    pattern stays visible. Adding a rule = adding one table entry.
+    """
+    rules = PARAM_INCOMPATIBILITIES.get(server, {}).get(action) or {}
+    for drop_param, triggers in rules.items():
+        if drop_param not in call_args:
+            continue
+        if triggers is None:
+            dropped = call_args.pop(drop_param)
+            logger.info(
+                f"{server}.{action}: dropped '{drop_param}'={dropped!r} "
+                f"(server rejects this argument — the query carries it)"
+            )
+            continue
+        for trigger, bad_values in triggers.items():
+            trigger_value = str(call_args.get(trigger, "")).lower()
+            if trigger_value in {str(v).lower() for v in bad_values}:
+                dropped = call_args.pop(drop_param)
+                logger.info(
+                    f"{server}.{action}: dropped '{drop_param}'={dropped!r} "
+                    f"(server rejects it with {trigger}={call_args.get(trigger)!r})"
+                )
+                break
+    return call_args
 
 
 # ---- Per-session state ------------------------------------------------------
@@ -727,6 +797,9 @@ class ServerGateway:
         # reconnect, no new tap.
         self.catalogue = _catalogue(self.server)
         call_args = dict(arguments.get("arguments") or {})
+        # Server-side incompatibilities die here, before any guard or wire:
+        # the model keeps passing what the schema told it was valid.
+        call_args = _strip_incompatible(self.server, action, call_args)
         # Models sometimes nest `confirmed` inside `arguments`. Honor it as
         # the top-level flag and strip it so it never reaches the real MCP
         # call or the fingerprints.

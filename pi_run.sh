@@ -67,13 +67,37 @@ for k in GITHUB_PAT TAVILY_API_KEY SPOTIFY_API_KEY; do
   env_has "$k" || log "note: no $k in .env — that MCP server is skipped, its tools stay off"
 done
 
-# 4) already running? ---------------------------------------------------------
+# 4) AEC — the Pi's mic must not hear the Pi's own speaker -------------------
+# Without echo cancellation Lava's voice comes back in the mic: the VAD fires
+# on HER voice, barge-in cuts her speech (the gappy, choppy playback), and
+# the room hears the echo. module-echo-cancel gives both sides a cancelled
+# twin; defaults point at them so pi_client's raw streams route through it.
+if command -v pactl >/dev/null 2>&1; then
+  if pactl list short sources 2>/dev/null | grep -q "lava_aec"; then
+    log "AEC source present (lava_aec)"
+  elif pactl load-module module-echo-cancel aec_method=webrtc \
+       source_name=lava_aec sink_name=lava_aec_sink >/dev/null 2>&1; then
+    log "echo canceller loaded (lava_aec source + sink)"
+  else
+    log "note: module-echo-cancel failed to load — Lava will hear her own"
+    log "      voice; use headphones or keep the speaker volume low"
+  fi
+  if pactl list short sources 2>/dev/null | grep -q "lava_aec"; then
+    pactl set-default-source lava_aec
+    pactl set-default-sink lava_aec_sink
+  fi
+else
+  log "note: no pactl (PulseAudio/PipeWire) — no echo cancellation here:"
+  log "      use headphones, or expect Lava to hear her own voice"
+fi
+
+# 5) already running? ---------------------------------------------------------
 if port_open 8000; then
   fail "something already listens on :8000 — is Lava up? stop first: bash pi_run.sh stop"
   exit 1
 fi
 
-# 5) server in the background, wait for the warm log line --------------------
+# 6) server in the background, wait for the warm log line --------------------
 mkdir -p logs
 # Fresh log each run: the wait loop greps for THIS run's warm line — an
 # appended old one would match instantly and hand pi_client a cold server.
@@ -108,7 +132,7 @@ case "$warm" in
     exit 1 ;;
 esac
 
-# 6) the voice — this terminal owns mic + speaker until Ctrl+C ---------------
+# 7) the voice — this terminal owns mic + speaker until Ctrl+C ---------------
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 log "laptop viewer:  http://${IP:-<pi-ip>}:8000/?view=1"
 log "talk to Lava — Ctrl+C stops the voice AND the server"

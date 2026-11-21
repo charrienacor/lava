@@ -81,7 +81,6 @@ VOICEPRINT_JSON = _ROOT / "data" / "voiceprint.json"
 # as the owner's. Same-speaker segments typically score >0.80, other
 # speakers <0.65; 0.75 is a middle value — validate with real voices and
 # override with ASR_SPEAKER_MIN_SIM if needed.
-MIN_SIMILARITY = float(os.environ.get("ASR_SPEAKER_MIN_SIM", "0.50"))
 # The transcription model is owned by .env (ASR_MODEL) — no code default:
 # a missing var fails loudly here instead of transcribing with a model the
 # agent side does not know about.

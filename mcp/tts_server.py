@@ -14,11 +14,18 @@ from piper import PiperVoice
 
 mcp = MCPServer("tts")
 
-VOICE = (
-    Path(__file__).resolve().parent
-    / "tts_model"
-    / "en_US-hfc_female-medium.onnx"
-)
+# The bundled default; TTS_VOICE in .env overrides (the Pi runs a low
+# tier — hfc_medium measured RTF ~1 on a Pi 4, amy-low ~30% less compute).
+DEFAULT_VOICE = "en_US-hfc_female-medium"
+
+VOICE_NAME = os.environ.get("TTS_VOICE") or DEFAULT_VOICE
+VOICE = Path(__file__).resolve().parent / "tts_model" / f"{VOICE_NAME}.onnx"
+if not VOICE.exists():
+    raise RuntimeError(
+        f"TTS_VOICE={VOICE_NAME}: {VOICE} does not exist — add its "
+        f".onnx/.onnx.json to mcp/tts_model/ or unset TTS_VOICE for the "
+        f"default {DEFAULT_VOICE}"
+    )
 
 voice = PiperVoice.load(str(VOICE))
 
@@ -38,7 +45,7 @@ def _warm_up() -> None:
     t = time.monotonic()
     for _ in voice.synthesize("Ready."):
         pass
-    log(f"voice warm in {time.monotonic() - t:.2f}s")
+    log(f"voice {VOICE_NAME} warm in {time.monotonic() - t:.2f}s")
 
 
 _warm_up()

@@ -292,6 +292,47 @@ def test_tavily_capped_per_user_turn(monkeypatch):
     assert "executed:tavily_extract" in out
 
 
+def test_tavily_country_fast_incompatibility_stripped(monkeypatch):
+    """The fix-retry ladder, killed at the source. Tavily's country
+    argument failed in TWO classes in one evening (rejected with
+    fast/ultra-fast depth; 'US'/'USA' rejected as invalid names), each
+    guess burning a call + an LLM round trip. The gateway strips it
+    unconditionally — and hides it from the advertised args, so the
+    model never learns to want it."""
+    captured = {}
+
+    async def fake_call(client, name, args, server=None):
+        captured.clear()
+        captured.update(args)
+        return "executed"
+
+    monkeypatch.setattr(tool_gateway, "call_mcp_tool", fake_call)
+    llm = FakeLLM()
+    asyncio.run(gateway_schemas(llm, {"tavily": object()}, {"tavily"}))
+    h = llm.fns["tavily"]
+    msgs = [{"role": "user", "content": "who won the midterms"}]
+
+    # stripped at fast depth, at basic depth, and with any value the
+    # model guesses ('US', 'USA', full names — all of it). Each call
+    # gets a fresh turn anchor: the per-turn cap (3) would otherwise
+    # deny the fourth search of a single test "turn".
+    for i, depth in enumerate(("fast", "ultra-fast", "basic", None)):
+        args = {"action": "tavily_search",
+                "arguments": {"query": "x", "country": "US"}}
+        if depth:
+            args["arguments"]["search_depth"] = depth
+        out = call(h, args, msgs)
+        assert "executed" in out and "<tool_result" in out
+        assert "country" not in captured, f"country survived at depth={depth}"
+        assert captured.get("query") == "x"
+        msgs.append({"role": "user", "content": f"and again {i}"})
+
+    # and it is no longer advertised: the schema the model sees must not
+    # name the argument the gateway will silently remove
+    d = tool_gateway._schema("tavily", _catalogue("tavily")).to_default_dict()
+    assert "country" not in d["description"]
+
+
 def test_disabled_tool_is_recognized_and_live_flips(monkeypatch, tmp_path):
     """Policy is live: a disabled tool is named (not 'unknown'), and flipping
     enabled = true mid-session lets the SAME session run it."""

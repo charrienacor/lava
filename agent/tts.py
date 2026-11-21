@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import os
 import re
 import time
 from typing import AsyncGenerator
@@ -78,7 +79,10 @@ class McpPiperTTSService(TTSService):
             push_stop_frames=True,
             settings=TTSSettings(
                 model="piper",
-                voice="en_US-hfc_female-medium",
+                # Display only: the tts MCP server owns synthesis and reads
+                # the same TTS_VOICE from .env (the voice can differ per
+                # host — the Pi runs a lighter tier).
+                voice=os.environ.get("TTS_VOICE") or "en_US-hfc_female-medium",
                 language=None,
             ),
             **kwargs,
